@@ -111,7 +111,7 @@ export function projectCoordinates(
 /**
  * Extracts Polygon coordinates from any GeoJSON Geometry
  */
-function extractCoordinatesFromGeometry(
+export function extractCoordinatesFromGeometry(
   geom: GeoJSON.Geometry,
   outPolygons: GeoJSON.Position[][][]
 ) {
@@ -260,6 +260,132 @@ export function computeProjectedBounds(
 }
 
 /**
+ * Baking information for a land shape inside an output surface (canvas pixels or vector art).
+ * Shared by the PNG canvas renderer and the vector XML exporters so both stay pixel-identical.
+ */
+export interface LandTransform {
+  /** Antimeridian-normalized polygons (the exact set used for the fit below) */
+  polygons: GeoJSON.Position[][][];
+  projection: MapProjection;
+  width: number;
+  height: number;
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  scale: number;
+  renderWidth: number;
+  renderHeight: number;
+  offsetX: number;
+  offsetY: number;
+  centerX: number;
+  centerY: number;
+  /** Projects [lng, lat] into output pixel space (Y flipped, shape centered & fitted) */
+  toCanvas: (lng: number, lat: number) => [number, number];
+}
+
+/**
+ * Fits a country's polygons into a width x height surface with padding, using the exact same
+ * conformal projection scale as the live map / Capture Studio canvas.
+ * Returns null when the polygons are empty or unprojectable.
+ */
+export function computeLandTransform(
+  polygons: GeoJSON.Position[][][],
+  options: {
+    width: number;
+    height: number;
+    paddingRatio?: number;
+    showTitle?: boolean;
+    projection?: MapProjection;
+  }
+): LandTransform | null {
+  const { width, height, paddingRatio = 0.12, showTitle = false, projection = "mercator" } = options;
+  if (!polygons || polygons.length === 0) return null;
+
+  const normalizedPolygons = normalizeAntimeridianPolygons(polygons);
+  const bounds = computeProjectedBounds(normalizedPolygons, projection);
+  if (!bounds) return null;
+
+  const { minX, maxX, minY, maxY } = bounds;
+  const projWidth = Math.max(0.00001, maxX - minX);
+  const projHeight = Math.max(0.00001, maxY - minY);
+
+  const paddingX = width * paddingRatio;
+  const paddingY = height * paddingRatio + (showTitle ? height * 0.08 : 0);
+  const usableWidth = width - 2 * paddingX;
+  const usableHeight = height - 2 * paddingY;
+
+  // Exact 1:1 conformal scale matching the map projection space
+  const scale = Math.min(usableWidth / projWidth, usableHeight / projHeight);
+
+  const renderWidth = projWidth * scale;
+  const renderHeight = projHeight * scale;
+  const offsetX = paddingX + (usableWidth - renderWidth) / 2;
+  const offsetY = paddingY + (usableHeight - renderHeight) / 2;
+
+  const centerX = offsetX + renderWidth / 2;
+  const centerY = offsetY + renderHeight / 2;
+
+  const toCanvas = (lng: number, lat: number): [number, number] => {
+    const [px, py] = projectCoordinates(lng, lat, projection);
+    return [offsetX + (px - minX) * scale, offsetY + (maxY - py) * scale];
+  };
+
+  return {
+    polygons: normalizedPolygons,
+    projection,
+    width,
+    height,
+    minX,
+    maxX,
+    minY,
+    maxY,
+    scale,
+    renderWidth,
+    renderHeight,
+    offsetX,
+    offsetY,
+    centerX,
+    centerY,
+    toCanvas,
+  };
+}
+
+/**
+ * Single-pass extraction of every country/region in a dataset.
+ * Used by the bulk "all countries × all eras" XML export, where calling
+ * getCountryGeometries() once per country would be needlessly expensive.
+ */
+export function getDatasetCountryGeometries(
+  geoJsonData: unknown
+): Map<string, { sovereign: string | null; polygons: GeoJSON.Position[][][] }> {
+  const byCountry = new Map<string, { sovereign: string | null; polygons: GeoJSON.Position[][][] }>();
+  const data = geoJsonData as {
+    features?: Array<{
+      properties?: Record<string, unknown> | null;
+      geometry?: GeoJSON.Geometry;
+    }>;
+  };
+
+  if (!data || !Array.isArray(data.features)) return byCountry;
+
+  data.features.forEach((f) => {
+    if (!f || !f.geometry) return;
+    const name = getFeatureName(f.properties);
+    if (!name) return;
+
+    let entry = byCountry.get(name);
+    if (!entry) {
+      entry = { sovereign: getFeatureSovereign(f.properties), polygons: [] };
+      byCountry.set(name, entry);
+    }
+    extractCoordinatesFromGeometry(f.geometry, entry.polygons);
+  });
+
+  return byCountry;
+}
+
+/**
  * Helper to convert hex to rgba string
  */
 export function hexToRgba(hex: string, alpha: number): string {
@@ -316,12 +442,16 @@ export function renderCountryToCanvas(
     ctx.fillRect(0, 0, width, height);
   }
 
-  // Normalize antimeridian coordinates
-  const normalizedPolygons = normalizeAntimeridianPolygons(polygons);
+  // Normalize antimeridian coordinates + fit the land into the canvas (shared with XML export)
+  const land = computeLandTransform(polygons, {
+    width,
+    height,
+    paddingRatio,
+    showTitle,
+    projection,
+  });
 
-  // Compute bounding box in the exact projected space
-  const bounds = computeProjectedBounds(normalizedPolygons, projection);
-  if (!bounds) {
+  if (!land) {
     ctx.fillStyle = "#9ca3af";
     ctx.font = "bold 20px system-ui, sans-serif";
     ctx.textAlign = "center";
@@ -329,36 +459,16 @@ export function renderCountryToCanvas(
     return;
   }
 
-  const { minX, maxX, minY, maxY } = bounds;
-  const projWidth = Math.max(0.00001, maxX - minX);
-  const projHeight = Math.max(0.00001, maxY - minY);
-
-  // Usable area inside canvas after padding
-  const paddingX = width * paddingRatio;
-  const paddingY = height * paddingRatio + (showTitle ? height * 0.08 : 0);
-  const usableWidth = width - 2 * paddingX;
-  const usableHeight = height - 2 * paddingY;
-
-  // Exact 1:1 conformal scale matching the map projection space
-  const scale = Math.min(usableWidth / projWidth, usableHeight / projHeight);
-
-  // Centering offsets
-  const actualRenderW = projWidth * scale;
-  const actualRenderH = projHeight * scale;
-  const offsetX = paddingX + (usableWidth - actualRenderW) / 2;
-  const offsetY = paddingY + (usableHeight - actualRenderH) / 2;
-
-  // Center coordinate of country on canvas
-  const countryCenterX = offsetX + actualRenderW / 2;
-  const countryCenterY = offsetY + actualRenderH / 2;
-
-  // Project coordinate to canvas pixel space
-  const toCanvas = (lng: number, lat: number): [number, number] => {
-    const [px, py] = projectCoordinates(lng, lat, projection);
-    const x = offsetX + (px - minX) * scale;
-    const y = offsetY + (maxY - py) * scale;
-    return [x, y];
-  };
+  const {
+    polygons: normalizedPolygons,
+    renderWidth: actualRenderW,
+    renderHeight: actualRenderH,
+    offsetX,
+    offsetY,
+    centerX: countryCenterX,
+    centerY: countryCenterY,
+    toCanvas,
+  } = land;
 
   // Construct path for all polygon rings
   const tracePolygons = () => {
