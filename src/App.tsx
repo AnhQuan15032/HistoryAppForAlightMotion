@@ -450,6 +450,7 @@ export default function App() {
         geoJsonData={activeGeoJsonData}
         selectedFeature={selectedFeature}
         initialImageFile={droppedImageFile}
+        onOpenCacheManager={() => { setCaptureTargetCountry(null); setShowCacheModal(true); }}
       />
 
       <CacheManagerModal

@@ -8,6 +8,16 @@ import {
   MapProjection,
 } from "../utils/geoCapture";
 import { PRESET_TEXTURES, TexturePreset } from "../utils/presetTextures";
+import {
+  buildXmlDocument,
+  yearFromLabel,
+  XML_FORMAT_INFO,
+  type XmlExportFormat,
+  type XmlImageOptions,
+} from "../utils/xmlExport";
+import { downloadBlob, formatBytes, imageSrcToDataUrl } from "../utils/fileDownload";
+import { getFeatureSovereign } from "../utils/countryFilter";
+import XmlBulkExportModal from "./XmlBulkExportModal";
 import { searchWikimediaFlags, fetchImageAsBlobUrl, WikiFlagResult } from "../utils/wikiFlags";
 import FlagAdjustPanel from "./FlagAdjustPanel";
 import SymbolPicker from "./SymbolPicker";
@@ -21,6 +31,7 @@ interface CaptureModalProps {
   geoJsonData: unknown | null;
   selectedFeature?: unknown | null;
   initialImageFile?: File | null;
+  onOpenCacheManager?: () => void;
 }
 
 type FillType = "color" | "image";
@@ -98,6 +109,7 @@ export default function CaptureModal({
   geoJsonData,
   selectedFeature,
   initialImageFile,
+  onOpenCacheManager,
 }: CaptureModalProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasContainerRef = useRef<HTMLDivElement | null>(null);
@@ -188,6 +200,24 @@ export default function CaptureModal({
   const [symbols, setSymbols] = useState<SymbolOptions[]>([{ ...DEFAULT_SYMBOL_OPTIONS }]);
   const [showSymbolPicker, setShowSymbolPicker] = useState<boolean>(false);
 
+  // ---- Vector XML export state (shared by single-capture + bulk all-era bundle) ----
+  const [xmlFormat, setXmlFormat] = useState<XmlExportFormat>(() => {
+    if (typeof window === "undefined") return "svg";
+    const saved = window.localStorage.getItem("am.capture.xmlFormat");
+    return saved === "svg" || saved === "alight" || saved === "geometry" ? saved : "svg";
+  });
+  const [xmlEmbedFlag, setXmlEmbedFlag] = useState<boolean>(false);
+  const [xmlIntroKeyframes, setXmlIntroKeyframes] = useState<boolean>(true);
+  const [isDownloadingXml, setIsDownloadingXml] = useState<boolean>(false);
+  const [xmlStatus, setXmlStatus] = useState<string | null>(null);
+  const [showBulkXmlModal, setShowBulkXmlModal] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("am.capture.xmlFormat", xmlFormat);
+    }
+  }, [xmlFormat]);
+
   // Canvas Pan & Drag State
   const [isPanningCanvas, setIsPanningCanvas] = useState<boolean>(false);
   const panStartRef = useRef<{ x: number; y: number; initialOffsetX: number; initialOffsetY: number } | null>(null);
@@ -258,6 +288,13 @@ export default function CaptureModal({
     if (!activeCountry || !geoJsonData) return [];
     return getCountryGeometries(geoJsonData, activeCountry, selectedFeature);
   }, [activeCountry, geoJsonData, selectedFeature]);
+
+  // Sovereign / ruling power recorded in the exported XML metadata
+  const activeSovereign = useMemo(() => {
+    if (!selectedFeature || activeCountry !== countryName) return null;
+    const props = (selectedFeature as { properties?: Record<string, unknown> | null })?.properties;
+    return getFeatureSovereign(props ?? null);
+  }, [selectedFeature, activeCountry, countryName]);
 
   // Render to canvas whenever options change
   useEffect(() => {
@@ -652,6 +689,96 @@ export default function CaptureModal({
     }
   };
 
+  // Build the vector XML document for the active shape, using the exact same
+  // projection + fit math as the canvas preview, then download it.
+  const handleDownloadXml = async () => {
+    if (!activeCountry || polygons.length === 0) {
+      setXmlStatus("No land geometry available for this region");
+      return;
+    }
+
+    setIsDownloadingXml(true);
+    setXmlStatus(null);
+
+    try {
+      const res = RESOLUTION_OPTIONS[resolutionIndex];
+
+      let embeddedImage: XmlImageOptions | null = null;
+      let embedFailed = false;
+
+      if (
+        xmlFormat === "svg" &&
+        xmlEmbedFlag &&
+        fillType === "image" &&
+        loadedImageEl &&
+        uploadedImageSrc
+      ) {
+        const dataUrl = await imageSrcToDataUrl(uploadedImageSrc);
+        if (dataUrl) {
+          embeddedImage = {
+            dataUrl,
+            naturalWidth: loadedImageEl.naturalWidth || 600,
+            naturalHeight: loadedImageEl.naturalHeight || 400,
+            fitMode: imageFitMode,
+            scale: imageScale,
+            offsetX: imageOffsetX,
+            offsetY: imageOffsetY,
+            rotation: imageRotation,
+            opacity: imageOpacity,
+            filterEffect,
+            tintColor: tintEnabled ? tintColor : null,
+            tintOpacity: tintEnabled ? tintOpacity : 0,
+            tintBlendMode,
+          };
+        } else {
+          embedFailed = true;
+        }
+      }
+
+      const built = buildXmlDocument({
+        format: xmlFormat,
+        countryName: activeCountry,
+        sovereign: activeSovereign,
+        yearLabel,
+        year: yearFromLabel(yearLabel),
+        polygons,
+        projection,
+        width: res.width,
+        height: res.height,
+        paddingRatio: 0.12,
+        showTitle,
+        fillColor: fillType === "image" ? baseLandColor : fillColor,
+        fillOpacity: fillType === "image" ? baseLandOpacity : fillOpacity,
+        borderColor,
+        borderWidth,
+        backgroundColor: backgroundColor === "custom" ? customBgColor : backgroundColor,
+        includeIntroKeyframes: xmlIntroKeyframes,
+        image: embeddedImage,
+        symbols: symbols.filter((s) => s.type !== "none").map((s) => s.type),
+      });
+
+      if (!built) {
+        setXmlStatus("Could not project this region's geometry — try another projection");
+        setIsDownloadingXml(false);
+        return;
+      }
+
+      downloadBlob(new Blob([built.xml], { type: built.mimeType }), built.filename);
+      setXmlStatus(
+        `${embedFailed ? "⚠️ Flag could not be embedded (cross-origin) — shape exported. " : ""}Saved ${built.filename} · ${formatBytes(
+          built.bytes
+        )} · ${built.stats.points} vertices in ${built.stats.parts} polygon part${
+          built.stats.parts !== 1 ? "s" : ""
+        }`
+      );
+      window.setTimeout(() => setXmlStatus(null), 9000);
+    } catch {
+      setXmlStatus("XML export failed for this region");
+    } finally {
+      setIsDownloadingXml(false);
+    }
+  };
+
   // Handle Copy to Clipboard
   const handleCopy = async () => {
     if (!canvasRef.current) return;
@@ -703,7 +830,8 @@ export default function CaptureModal({
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <h2 className="text-base sm:text-lg font-bold text-white tracking-tight">
-                  Capture Land (PNG)
+                  Capture Studio
+                  <span className="ml-1.5 text-[10px] font-mono font-bold text-amber-400/90 align-middle">PNG · VECTOR XML</span>
                 </h2>
                 <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-400/20 text-amber-300 font-mono">
                   {yearLabel}
@@ -1397,6 +1525,104 @@ export default function CaptureModal({
                   />
                 </div>
 
+                {/* SECTION 1C: Vector XML Export (SVG / AM preset / raw geometry) */}
+                <div className="pt-3 border-t border-white/10 flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-bold uppercase tracking-wider text-amber-300">
+                      🧬 Vector XML Export
+                    </label>
+                    <span className="text-[10px] font-mono text-gray-500">
+                      {RESOLUTION_OPTIONS[resolutionIndex].width}×{RESOLUTION_OPTIONS[resolutionIndex].height} · {projection}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(Object.keys(XML_FORMAT_INFO) as XmlExportFormat[]).map((id) => {
+                      const info = XML_FORMAT_INFO[id];
+                      const active = xmlFormat === id;
+                      return (
+                        <button
+                          key={id}
+                          onClick={() => setXmlFormat(id)}
+                          title={info.desc}
+                          className={`flex flex-col items-center gap-0.5 px-1.5 py-2 rounded-xl border transition-all cursor-pointer ${
+                            active
+                              ? "bg-amber-500/20 border-amber-400 text-amber-200 shadow-sm"
+                              : "bg-white/5 border-white/10 text-gray-300 hover:bg-white/10"
+                          }`}
+                        >
+                          <span className="text-sm leading-none">{info.icon}</span>
+                          <span className="text-[10px] font-bold leading-tight text-center">{info.label}</span>
+                          <span className="text-[9px] font-mono text-gray-500 leading-none">.{info.ext}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <p className="text-[10px] text-gray-400 leading-snug">{XML_FORMAT_INFO[xmlFormat].desc}</p>
+                  <p className="text-[10px] text-amber-400/90 leading-snug">
+                    💡 {XML_FORMAT_INFO[xmlFormat].bestFor}
+                  </p>
+                  {xmlFormat === "alight" && (
+                    <p className="text-[9px] text-gray-500 leading-snug">
+                      Unofficial community-style layout — Alight Motion's own project schema is not public, so
+                      treat the path data as the source of truth.
+                    </p>
+                  )}
+
+                  {xmlFormat === "svg" && fillType === "image" && uploadedImageSrc && (
+                    <label className="flex items-center gap-2 text-[11px] text-gray-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={xmlEmbedFlag}
+                        onChange={(e) => setXmlEmbedFlag(e.target.checked)}
+                        className="rounded accent-amber-500 w-3.5 h-3.5 cursor-pointer"
+                      />
+                      <span>Embed flag image inside the SVG (clipped to the land · bigger file)</span>
+                    </label>
+                  )}
+
+                  {xmlFormat === "alight" && (
+                    <label className="flex items-center gap-2 text-[11px] text-gray-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={xmlIntroKeyframes}
+                        onChange={(e) => setXmlIntroKeyframes(e.target.checked)}
+                        className="rounded accent-amber-500 w-3.5 h-3.5 cursor-pointer"
+                      />
+                      <span>Add scale + fade intro keyframes</span>
+                    </label>
+                  )}
+
+                  {xmlStatus && (
+                    <p className="text-[10px] text-emerald-300 leading-snug break-words animate-fadeIn">{xmlStatus}</p>
+                  )}
+
+                  <button
+                    onClick={handleDownloadXml}
+                    disabled={isDownloadingXml || polygons.length === 0}
+                    className="w-full flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-sky-600 hover:from-cyan-400 hover:to-sky-500 text-gray-950 text-[11px] font-extrabold shadow-lg shadow-cyan-500/20 transition-all active:scale-95 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <span>🧬</span>
+                    <span>{isDownloadingXml ? "Building XML…" : `Download ${XML_FORMAT_INFO[xmlFormat].label} as XML`}</span>
+                  </button>
+
+                  <button
+                    onClick={() => setShowBulkXmlModal(true)}
+                    className="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-white/5 hover:bg-emerald-500/15 border border-white/10 hover:border-emerald-500/40 transition-all cursor-pointer group text-left"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-[11px] font-bold text-gray-200 group-hover:text-emerald-200">
+                        🌍 Download ALL XML — every country × every era
+                      </p>
+                      <p className="text-[9px] text-gray-500">
+                        Cache-first ZIP · folder per country · no network requests
+                      </p>
+                    </div>
+                    <span className="text-[10px] font-bold text-emerald-300 shrink-0">OPEN</span>
+                  </button>
+                </div>
+
                 {/* SECTION 2: Straight Border Controls */}
             <div className="pt-3 border-t border-white/10">
               <div className="flex items-center justify-between mb-1.5">
@@ -1531,7 +1757,9 @@ export default function CaptureModal({
         {/* Footer Action Buttons */}
         <div className="flex items-center justify-between px-6 py-4 border-t border-white/10 bg-white/[0.02]">
           <div className="text-xs text-gray-400 hidden sm:block">
-            ✨ {fillType === "image" ? "Image on top of land base color" : "Transparent PNG land cutout"} ready for export
+            ✨ {fillType === "image" ? "Image on top of land base color" : "Transparent PNG land cutout"} ·{" "}
+            {XML_FORMAT_INFO[xmlFormat].label} export ready ({polygons.length} polygon
+            {polygons.length !== 1 ? "s" : ""})
           </div>
 
           <div className="flex items-center gap-2.5 w-full sm:w-auto justify-end">
@@ -1541,6 +1769,15 @@ export default function CaptureModal({
             >
               <span>{copied ? "✅" : "📋"}</span>
               <span>{copied ? "Copied PNG!" : "Copy to Clipboard"}</span>
+            </button>
+
+            <button
+              onClick={handleDownloadXml}
+              disabled={isDownloadingXml || polygons.length === 0}
+              className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-cyan-400/40 bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 text-xs font-bold transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <span>🧬</span>
+              <span>{isDownloadingXml ? "Building XML..." : `Download ${XML_FORMAT_INFO[xmlFormat].label} XML`}</span>
             </button>
 
             <button
@@ -1554,6 +1791,19 @@ export default function CaptureModal({
           </div>
         </div>
       </div>
+
+      <XmlBulkExportModal
+        isOpen={showBulkXmlModal}
+        onClose={() => setShowBulkXmlModal(false)}
+        initialFormat={xmlFormat}
+        projection={projection}
+        width={RESOLUTION_OPTIONS[resolutionIndex].width}
+        height={RESOLUTION_OPTIONS[resolutionIndex].height}
+        onOpenCacheManager={() => {
+          setShowBulkXmlModal(false);
+          onOpenCacheManager?.();
+        }}
+      />
     </div>
   );
 }
