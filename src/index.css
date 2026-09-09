@@ -1,0 +1,231 @@
+@import "tailwindcss";
+
+/* ===== Leaflet Tooltip ===== */
+.history-tooltip {
+  background: rgba(17, 24, 39, 0.95) !important;
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 8px !important;
+  padding: 6px 10px !important;
+  color: #e5e7eb !important;
+  font-family: system-ui, -apple-system, sans-serif !important;
+  font-size: 12px !important;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4) !important;
+}
+
+.history-tooltip::before {
+  border-top-color: rgba(17, 24, 39, 0.95) !important;
+}
+
+/* ===== Country Map Labels (Times New Roman Cartography) ===== */
+.country-map-label {
+  font-family: "Times New Roman", Times, "Liberation Serif", "Nimbus Roman No9 L", "Georgia", serif !important;
+  pointer-events: auto;
+  user-select: none;
+}
+
+/* ===== Timeline Slider (Mobile Touch Ergonomics) ===== */
+.timeline-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(
+    to right,
+    #78350f,
+    #92400e,
+    #b45309,
+    #d97706,
+    #f59e0b,
+    #fbbf24
+  );
+  outline: none;
+  cursor: pointer;
+  position: relative;
+  touch-action: pan-y;
+}
+
+.timeline-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #fbbf24, #f59e0b);
+  border: 3px solid #111827;
+  cursor: pointer;
+  box-shadow:
+    0 0 0 2px rgba(251, 191, 36, 0.4),
+    0 2px 8px rgba(0, 0, 0, 0.5);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.timeline-slider::-webkit-slider-thumb:hover,
+.timeline-slider::-webkit-slider-thumb:active {
+  transform: scale(1.18);
+  box-shadow:
+    0 0 0 4px rgba(251, 191, 36, 0.5),
+    0 2px 12px rgba(0, 0, 0, 0.6);
+}
+
+.timeline-slider::-moz-range-thumb {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #fbbf24, #f59e0b);
+  border: 3px solid #111827;
+  cursor: pointer;
+  box-shadow:
+    0 0 0 2px rgba(251, 191, 36, 0.4),
+    0 2px 8px rgba(0, 0, 0, 0.5);
+}
+
+.timeline-slider::-moz-range-track {
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(
+    to right,
+    #78350f,
+    #92400e,
+    #b45309,
+    #d97706,
+    #f59e0b,
+    #fbbf24
+  );
+}
+
+/* ===== Custom Scrollbar ===== */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 3px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* ===== Mobile Safe Area ===== */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* ===== Animations ===== */
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-slideIn {
+  animation: slideIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes scaleUp {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-scaleUp {
+  animation: scaleUp 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ===== Leaflet overrides ===== */
+.leaflet-container {
+  background: #111827 !important;
+  font-family: "Times New Roman", Times, "Liberation Serif", serif;
+  touch-action: pan-x pan-y;
+}
+
+.leaflet-control-zoom {
+  border: none !important;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3) !important;
+}
+
+.leaflet-control-zoom a {
+  background: rgba(17, 24, 39, 0.9) !important;
+  backdrop-filter: blur(8px);
+  color: #e5e7eb !important;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+  width: 38px !important;
+  height: 38px !important;
+  line-height: 38px !important;
+  font-size: 17px !important;
+}
+
+.leaflet-control-zoom a:hover,
+.leaflet-control-zoom a:active {
+  background: rgba(31, 41, 55, 0.95) !important;
+  color: #fbbf24 !important;
+}
+
+.leaflet-control-zoom-in {
+  border-radius: 10px 10px 0 0 !important;
+}
+
+.leaflet-control-zoom-out {
+  border-radius: 0 0 10px 10px !important;
+}
+
+.leaflet-control-attribution {
+  background: rgba(17, 24, 39, 0.7) !important;
+  backdrop-filter: blur(4px);
+  color: #6b7280 !important;
+  font-size: 9px !important;
+  padding: 2px 6px !important;
+  border-radius: 4px 0 0 0 !important;
+}
+
+.leaflet-control-attribution a {
+  color: #9ca3af !important;
+}
+
+/* ===== Body ===== */
+body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: #0a0a0f;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+}
