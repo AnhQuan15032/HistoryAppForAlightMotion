@@ -164,6 +164,32 @@ assert(
 // — multiply + screen — plus tint rect + country path = 4 mix-blend-mode occurrences)
 assert((stacked!.xml.match(/mix-blend-mode:/g) || []).length === 4, "blend: no stray blend styles emitted");
 
+// ── TILED layer (mirror repeat) → SVG <pattern> + rect ──
+const tiledLayer = { ...imgA, tile: true, blendMode: "multiply", filterEffect: "grayscale" as const };
+const tiledDoc = buildXmlDocument({
+  ...base,
+  format: "svg",
+  image: null,
+  layers: [tiledLayer, { kind: "country" as const, blendMode: "screen" }],
+});
+
+assert(!!tiledDoc, "tile: document built");
+assert(
+  tiledDoc!.xml.includes('<pattern id="testland-tile-0" width="200" height="200" patternUnits="userSpaceOnUse">'),
+  "tile: 2×2 pattern def emitted at double image size"
+);
+assert((tiledDoc!.xml.match(/<pattern id="testland-tile-0"/g) || []).length === 1, "tile: single pattern def");
+assert((tiledDoc!.xml.match(/<image /g) || []).length === 4, "tile: pattern holds 4 mirrored image cells");
+assert(/transform="translate\(200 0\) scale\(-1 1\)"/.test(tiledDoc!.xml), "tile: right cell flipped X");
+assert(/transform="translate\(0 200\) scale\(1 -1\)"/.test(tiledDoc!.xml), "tile: bottom cell flipped Y");
+assert(/transform="translate\(200 200\) scale\(-1 -1\)"/.test(tiledDoc!.xml), "tile: corner cell flipped both ways");
+assert(/<rect[^>]*fill="url\(#testland-tile-0\)"/.test(tiledDoc!.xml), "tile: rect filled with the pattern");
+assert(/<rect[^>]*style="mix-blend-mode:multiply"/.test(tiledDoc!.xml), "tile: rect carries the layer blend mode");
+assert(/<rect[^>]*opacity="1"[^>]*transform="translate\([0-9.-]+ [0-9.-]+\)"/.test(tiledDoc!.xml), "tile: rect keeps layer opacity + placement transform");
+const tGroup = tiledDoc!.xml.indexOf('<g id="testland-layer-0" clip-path="url(#testland-clip)">');
+const tRect = tiledDoc!.xml.indexOf('fill="url(#testland-tile-0)"');
+assert(tGroup >= 0 && tRect > tGroup, "tile: pattern rect inside the clipped layer group");
+
 console.log("\n--- BELOW MODE SVG (body excerpt) ---");
 const i = below!.xml.indexOf("<svg");
 const j = below!.xml.indexOf("</svg>");

@@ -20,7 +20,8 @@ const polygons = [
 
 function makeRecordingCanvas() {
   const calls: string[] = [];
-  const state = { fillStyle: "", globalAlpha: 1, gco: "source-over" };
+  const state = { fillStyle: "" as string | object, globalAlpha: 1, gco: "source-over" };
+  const patternSentinel = { toString: () => "<pattern>" } as unknown as CanvasPattern;
   const ctx = {
     filter: "none",
     strokeStyle: "",
@@ -33,6 +34,11 @@ function makeRecordingCanvas() {
     textBaseline: "",
     clearRect: () => calls.push("clearRect"),
     fillRect: () => calls.push(`fillRect:${state.fillStyle}`),
+    createPattern: (_source: unknown, type: string) => {
+      calls.push(`createPattern:${type}`);
+      return patternSentinel;
+    },
+    scale: (sx: number, sy: number) => calls.push(`scale:${sx},${sy}`),
     beginPath: () => calls.push("beginPath"),
     moveTo: () => {},
     lineTo: () => {},
@@ -46,7 +52,7 @@ function makeRecordingCanvas() {
     fill: (rule?: string) => calls.push(`fill:${rule ?? "nonzero"}:${state.fillStyle}`),
     stroke: () => calls.push("stroke"),
     fillText: () => {},
-    set fillStyle(v: string) {
+    set fillStyle(v: string | object) {
       state.fillStyle = v;
     },
     get fillStyle() {
@@ -313,6 +319,87 @@ function assert(cond: boolean, msg: string) {
     gcoOverlay > fillIdx && gcoOverlay < drawIdx2,
     "blend: top image layer sets 'overlay' before its draw"
   );
+}
+
+// 7) TILED layer: mirror-repeat pattern fill instead of a stretched drawImage
+{
+  const mirrorCalls: string[] = [];
+  const mirrorCtx = {
+    save: () => mirrorCalls.push("save"),
+    restore: () => mirrorCalls.push("restore"),
+    translate: (x: number, y: number) => mirrorCalls.push(`translate:${x},${y}`),
+    scale: (sx: number, sy: number) => mirrorCalls.push(`scale:${sx},${sy}`),
+    drawImage: () => mirrorCalls.push("drawImage"),
+  };
+  const tileBuilds: number[] = [];
+  (globalThis as unknown as { document: unknown }).document = {
+    createElement: () => {
+      tileBuilds.push(1);
+      return { width: 0, height: 0, getContext: () => mirrorCtx };
+    },
+  };
+
+  const tileImage = {
+    complete: true,
+    naturalWidth: 80,
+    naturalHeight: 60,
+    width: 80,
+    height: 60,
+  } as unknown as HTMLImageElement;
+
+  const tileLayer = {
+    kind: "image" as const,
+    image: tileImage,
+    fitMode: "cover" as const,
+    scale: 2,
+    offsetX: 0,
+    offsetY: 0,
+    rotation: 0,
+    opacity: 1,
+    tile: true,
+    clipToLand: true,
+  };
+
+  const { canvas, calls } = makeRecordingCanvas();
+  renderCountryToCanvas(canvas, polygons, {
+    ...baseOptions,
+    fillOpacity: 0.4,
+    imageFill: null,
+    layers: [tileLayer, { kind: "country", fillColor: "#DC2626", fillOpacity: 0.4 }],
+  });
+
+  const patternIdx = calls.indexOf("createPattern:repeat");
+  const scaleIdx = calls.indexOf("scale:2,2");
+  const patternFillIdx = calls.indexOf("fillRect:<pattern>");
+  const countryFillIdx = calls.findIndex((c) => c === "fill:evenodd:rgba(220, 38, 38, 0.4)");
+  const strokeIdx = calls.lastIndexOf("stroke");
+
+  assert(patternIdx >= 0, "tile: repeating pattern created from the layer image");
+  assert(
+    patternFillIdx > patternIdx && patternFillIdx > scaleIdx,
+    "tile: layer painted via a pattern fillRect (after the layer scale)"
+  );
+  assert(!calls.includes("drawImage"), "tile: no stretched drawImage for the tiled layer");
+  assert(
+    patternFillIdx < countryFillIdx && countryFillIdx < strokeIdx,
+    "tile: tiled layer keeps its stack position"
+  );
+
+  // Mirror super-tile holds 4 quadrants: normal / flipX / flipY / flipXY
+  assert(mirrorCalls.filter((c) => c === "drawImage").length === 4, "tile: mirror source holds 4 image cells");
+  const mSeq = mirrorCalls.join(" ");
+  assert(mSeq.includes("translate:80,0 scale:-1,1"), "tile: right cell mirrored horizontally");
+  assert(mSeq.includes("translate:0,60 scale:1,-1"), "tile: bottom cell mirrored vertically");
+  assert(mSeq.includes("translate:80,60 scale:-1,-1"), "tile: corner cell mirrored both ways");
+
+  // A second render reuses the cached super-tile (built once per image)
+  renderCountryToCanvas(canvas, polygons, {
+    ...baseOptions,
+    fillOpacity: 0.4,
+    imageFill: null,
+    layers: [tileLayer],
+  });
+  assert(tileBuilds.length === 1, "tile: mirror super-tile cached per image (built once)");
 }
 
 console.log("\n--- BELOW mode call sequence ---");

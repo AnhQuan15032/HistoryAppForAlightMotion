@@ -92,6 +92,8 @@ export interface XmlImageLayerSpec {
   clipToLand: boolean;
   /** Composite (blend) mode vs everything beneath (CSS mix-blend-mode name; "source-over"/"normal" = default) */
   blendMode?: string;
+  /** mirror-repeat the image as a texture (fit mode ignored) */
+  tile?: boolean;
   /** atmosphere tint painted over this image layer */
   tint?: { color: string; opacity: number; blend: string } | null;
 }
@@ -587,12 +589,26 @@ function buildSvgDocument(input: XmlExportInput, tf: LandTransform, parts: Proce
       );
     }
     const usedFilterIds = new Set<string>();
-    layerStack.forEach((layer) => {
+    layerStack.forEach((layer, index) => {
       if (layer.kind === "country") return;
       const f = svgFilterDef(layer.filterEffect);
       if (f && !usedFilterIds.has(f.id)) {
         usedFilterIds.add(f.id);
         defsLines.push(`    ${f.markup}`);
+      }
+      if (layer.tile) {
+        // 2×2 mirrored super-tile: each cell is the image flipped across the
+        // shared edge, so the repeat is seamless (matches the canvas renderer)
+        const tw = Math.max(1, layer.naturalWidth);
+        const th = Math.max(1, layer.naturalHeight);
+        defsLines.push(
+          `    <pattern id="${landId}-tile-${index}" width="${px(tw * 2)}" height="${px(th * 2)}" patternUnits="userSpaceOnUse">`,
+          `      <image href="${layer.dataUrl}" x="0" y="0" width="${px(tw)}" height="${px(th)}"/>`,
+          `      <image href="${layer.dataUrl}" x="0" y="0" width="${px(tw)}" height="${px(th)}" transform="translate(${px(tw * 2)} 0) scale(-1 1)"/>`,
+          `      <image href="${layer.dataUrl}" x="0" y="0" width="${px(tw)}" height="${px(th)}" transform="translate(0 ${px(th * 2)}) scale(1 -1)"/>`,
+          `      <image href="${layer.dataUrl}" x="0" y="0" width="${px(tw)}" height="${px(th)}" transform="translate(${px(tw * 2)} ${px(th * 2)}) scale(-1 -1)"/>`,
+          `    </pattern>`
+        );
       }
     });
     if (defsLines.length > 0) {
@@ -615,7 +631,20 @@ function buildSvgDocument(input: XmlExportInput, tf: LandTransform, parts: Proce
       }
       const f = svgFilterDef(layer.filterEffect);
       const filterAttr = f ? ` filter="url(#${f.id})"` : "";
-      const markup = imageMarkupFor(layer, filterAttr);
+      const markup = layer.tile
+        ? (() => {
+            // Mirror-repeat texture: pattern-filled rect in the layer's local
+            // space (big enough to stay covered under pan/rotation)
+            const shiftX = (layer.offsetX / 100) * tf.renderWidth;
+            const shiftY = (layer.offsetY / 100) * tf.renderHeight;
+            const cover = Math.max(input.width, input.height) * 2;
+            return `    <rect x="${px(-cover)}" y="${px(-cover)}" width="${px(cover * 2)}" height="${px(cover * 2)}" fill="url(#${landId}-tile-${index})" opacity="${pct(layer.opacity)}"${filterAttr}${blendStyleFor(
+              layer.blendMode
+            )} transform="translate(${px(tf.centerX + shiftX)} ${px(tf.centerY + shiftY)})${
+              layer.rotation ? ` rotate(${pct(layer.rotation)})` : ""
+            }"/>`;
+          })()
+        : imageMarkupFor(layer, filterAttr);
 
       if (layer.clipToLand) {
         blocks.push(

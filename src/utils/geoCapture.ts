@@ -60,6 +60,8 @@ export interface ImageDrawParams {
   rotation: number;
   opacity: number;
   filterEffect?: ImageFilterEffect;
+  /** Mirror-repeat the image as a texture instead of stretching it (fit mode ignored) */
+  tile?: boolean;
 }
 
 export interface RenderImageLayer extends ImageDrawParams {
@@ -437,6 +439,49 @@ export function getDatasetCountryGeometries(
   return byCountry;
 }
 
+/** 2×2 mirrored super-tile cache, keyed by the source image element */
+const mirrorTileCache = new WeakMap<object, HTMLCanvasElement>();
+
+/**
+ * Builds (and caches) the seamless mirror-tile source for an image: a 2×2
+ * super-tile whose cells are the image mirrored across each shared edge, so
+ * repeating the pattern shows no visible seam. Falls back to the raw image
+ * (plain repeat) when no canvas 2d context is available.
+ */
+function tileSourceFor(img: HTMLImageElement): HTMLCanvasElement | HTMLImageElement {
+  const cached = mirrorTileCache.get(img as object);
+  if (cached) return cached;
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (typeof document === "undefined" || !w || !h) return img;
+
+  const tile = document.createElement("canvas");
+  tile.width = w * 2;
+  tile.height = h * 2;
+  const tctx = tile.getContext("2d");
+  if (!tctx) return img;
+
+  tctx.drawImage(img, 0, 0); // top-left: normal
+  tctx.save();
+  tctx.translate(w, 0);
+  tctx.scale(-1, 1);
+  tctx.drawImage(img, 0, 0); // top-right: mirrored X
+  tctx.restore();
+  tctx.save();
+  tctx.translate(0, h);
+  tctx.scale(1, -1);
+  tctx.drawImage(img, 0, 0); // bottom-left: mirrored Y
+  tctx.restore();
+  tctx.save();
+  tctx.translate(w, h);
+  tctx.scale(-1, -1);
+  tctx.drawImage(img, 0, 0); // bottom-right: mirrored both
+  tctx.restore();
+
+  mirrorTileCache.set(img as object, tile);
+  return tile;
+}
+
 /**
  * Helper to convert hex to rgba string
  */
@@ -622,7 +667,45 @@ export function renderCountryToCanvas(
     }
 
     ctx.globalAlpha = Math.max(0, Math.min(1, imgOpacity));
-    ctx.drawImage(img, -finalW / 2, -finalH / 2, finalW, finalH);
+
+    if (p.tile) {
+      // Mirror-repeat texture: the pattern is anchored at the layer origin, so
+      // panning / rotating / scaling the layer moves & resizes the tiles with it.
+      const pattern = ctx.createPattern(tileSourceFor(img), "repeat");
+      if (pattern) {
+        const s = userScale > 0 ? userScale : 1;
+        const rotRad = (rotation * Math.PI) / 180;
+        const cos = Math.cos(rotRad);
+        const sin = Math.sin(rotRad);
+        // Canvas corners expressed in the layer's local space (post-rotate,
+        // post-scale) — fill exactly the visible area, nothing more.
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        const corners: Array<[number, number]> = [
+          [0, 0],
+          [width, 0],
+          [width, height],
+          [0, height],
+        ];
+        for (const [gx, gy] of corners) {
+          const dx = gx - (countryCenterX + shiftX);
+          const dy = gy - (countryCenterY + shiftY);
+          const lx = (dx * cos + dy * sin) / s;
+          const ly = (-dx * sin + dy * cos) / s;
+          if (lx < minX) minX = lx;
+          if (lx > maxX) maxX = lx;
+          if (ly < minY) minY = ly;
+          if (ly > maxY) maxY = ly;
+        }
+        ctx.scale(s, s);
+        ctx.fillStyle = pattern;
+        ctx.fillRect(minX, minY, maxX - minX, maxY - minY);
+      }
+    } else {
+      ctx.drawImage(img, -finalW / 2, -finalH / 2, finalW, finalH);
+    }
 
     ctx.restore();
   };

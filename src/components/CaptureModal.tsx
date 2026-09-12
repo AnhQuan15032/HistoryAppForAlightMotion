@@ -511,6 +511,12 @@ export default function CaptureModal({
     );
   }, []);
 
+  const toggleLayerTile = useCallback((id: string) => {
+    setLayers((prev) =>
+      prev.map((l) => (l.id === id && l.kind === "image" ? { ...l, tile: !l.tile } : l))
+    );
+  }, []);
+
   /** Write-through setters: edit the buffer AND the selected image layer in one step */
   type LayerFieldValue<K extends "fitMode" | "scale" | "offsetX" | "offsetY" | "rotation" | "opacity"> =
     Exclude<StudioLayer[K], undefined>;
@@ -1313,6 +1319,7 @@ export default function CaptureModal({
             opacity: layer.opacity ?? 1,
             filterEffect: layer.filterEffect,
             blendMode: layer.blendMode,
+            tile: layer.tile === true,
             clipToLand: layer.clipToLand ?? true,
             tint:
               tintEnabled && (layer.clipToLand ?? true)
@@ -1909,6 +1916,26 @@ export default function CaptureModal({
                             <button
                               onClick={(e) => {
                                 e.stopPropagation();
+                                toggleLayerTile(layer.id);
+                              }}
+                              title={
+                                layer.tile
+                                  ? "Tile ON — mirror-repeat texture; click to stretch instead"
+                                  : "Tile OFF — click to mirror-repeat this image as a texture"
+                              }
+                              className={`shrink-0 px-1 h-5 rounded-md text-[10px] font-bold transition-colors cursor-pointer ${
+                                layer.tile
+                                  ? "bg-amber-400/25 text-amber-300"
+                                  : "bg-white/10 text-gray-500 hover:text-gray-300"
+                              }`}
+                            >
+                              🔁
+                            </button>
+                          )}
+                          {layer.kind === "image" && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
                                 toggleLayerClip(layer.id);
                               }}
                               title={
@@ -2493,6 +2520,17 @@ export default function CaptureModal({
                 {/* Blend mode + color tone — apply to the SELECTED image layer */}
                 {selectedImageLayer && (
                   <div className="flex flex-col gap-1.5 pt-1 border-t border-white/5">
+                    <label className="flex items-center justify-between text-[11px] text-gray-300 cursor-pointer">
+                      <span title="Repeat the image (mirrored) as a texture instead of stretching it">
+                        🔁 Tile (mirror repeat)
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={selectedImageLayer.tile === true}
+                        onChange={() => toggleLayerTile(selectedImageLayer.id)}
+                        className="rounded accent-amber-500 w-3.5 h-3.5 cursor-pointer"
+                      />
+                    </label>
                     <div className="flex items-center justify-between text-[11px] text-gray-300">
                       <span>Blend Mode (vs layers beneath):</span>
                       <select

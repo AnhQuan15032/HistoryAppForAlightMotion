@@ -38,6 +38,8 @@ export interface StudioLayer {
   filterEffect?: ImageFilterEffect;
   /** Composite (blend) mode vs everything beneath this layer ("source-over" = normal) */
   blendMode?: GlobalCompositeOperation;
+  /** Mirror-repeat the image as a texture instead of stretching it (fit mode ignored) */
+  tile?: boolean;
   /** Mask (clip) this layer to the selected country's territory */
   clipToLand?: boolean;
 }
@@ -107,6 +109,7 @@ export function createImageLayer(src: string, name: string, assetId?: string): S
     opacity: 1,
     filterEffect: "none",
     blendMode: "source-over",
+    tile: false,
     clipToLand: true, // masked to territory — the classic look
   };
 }
@@ -165,6 +168,7 @@ export function sanitizeStoredStack(raw: unknown): StudioLayer[] | null {
         blendMode: BLEND_MODES.includes(l.blendMode as GlobalCompositeOperation)
           ? (l.blendMode as GlobalCompositeOperation)
           : "source-over",
+        tile: l.tile === true,
         clipToLand: l.clipToLand !== false,
       });
     } else if (l.kind === "country") {
