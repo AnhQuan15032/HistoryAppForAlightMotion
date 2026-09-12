@@ -14,7 +14,12 @@
  *                 AND baked pixels, plus bounds, centroids and styling.
  */
 
-import { computeLandTransform, type LandTransform, type MapProjection } from "./geoCapture";
+import {
+  computeLandTransform,
+  type LandTransform,
+  type MapProjection,
+  type ImageLayerOrder,
+} from "./geoCapture";
 import type { ImageFilterEffect } from "./geoCapture";
 
 export type XmlExportFormat = "svg" | "alight" | "geometry";
@@ -63,7 +68,41 @@ export interface XmlImageOptions {
   tintColor?: string | null;
   tintOpacity?: number;
   tintBlendMode?: string;
+  /** "masked" (default) = image clipped inside the land; "below" = full image with the country fill on top */
+  layerOrder?: ImageLayerOrder;
 }
+
+/**
+ * One entry of the multi-layer SVG stack (Capture Studio layer editor).
+ * Order is BOTTOM → TOP; the land stroke is always painted last (topmost).
+ */
+export interface XmlImageLayerSpec {
+  kind: "image";
+  dataUrl: string;
+  naturalWidth: number;
+  naturalHeight: number;
+  fitMode: "cover" | "contain" | "stretch" | "manual";
+  scale: number;
+  offsetX: number;
+  offsetY: number;
+  rotation: number;
+  opacity: number;
+  filterEffect?: ImageFilterEffect;
+  /** image clipped inside the land outline */
+  clipToLand: boolean;
+  /** Composite (blend) mode vs everything beneath (CSS mix-blend-mode name; "source-over"/"normal" = default) */
+  blendMode?: string;
+  /** atmosphere tint painted over this image layer */
+  tint?: { color: string; opacity: number; blend: string } | null;
+}
+
+export interface XmlCountryLayerSpec {
+  kind: "country";
+  /** Composite (blend) mode of the territory fill (CSS mix-blend-mode name) */
+  blendMode?: string;
+}
+
+export type XmlRenderLayer = XmlImageLayerSpec | XmlCountryLayerSpec;
 
 export interface XmlExportInput {
   format: XmlExportFormat;
@@ -86,6 +125,11 @@ export interface XmlExportInput {
   maxPointsPerRing?: number;
   includeIntroKeyframes?: boolean;
   image?: XmlImageOptions | null;
+  /**
+   * Multi-layer stack, BOTTOM → TOP (Capture Studio layer editor).
+   * When present, the SVG paints this stack and ignores `image`.
+   */
+  layers?: XmlRenderLayer[];
   symbols?: string[];
 }
 
@@ -409,8 +453,10 @@ function svgFilterDef(effect: ImageFilterEffect | undefined): { id: string; mark
 }
 
 /** Mirrors the canvas fit-mode + transform math so the SVG flag sits exactly like the PNG one */
-function imageGeometry(input: XmlExportInput, tf: LandTransform) {
-  const img = input.image!;
+function imageGeometryFor(
+  img: { naturalWidth: number; naturalHeight: number; fitMode: string; scale: number; offsetX: number; offsetY: number },
+  tf: LandTransform
+) {
   const imgW = Math.max(1, img.naturalWidth);
   const imgH = Math.max(1, img.naturalHeight);
 
@@ -437,6 +483,11 @@ function imageGeometry(input: XmlExportInput, tf: LandTransform) {
   const shiftY = (img.offsetY / 100) * tf.renderHeight;
 
   return { finalW, finalH, shiftX, shiftY };
+}
+
+/** Legacy single-image variant */
+function imageGeometry(input: XmlExportInput, tf: LandTransform) {
+  return imageGeometryFor(input.image!, tf);
 }
 
 function buildSvgDocument(input: XmlExportInput, tf: LandTransform, parts: ProcessedPart[]): string {
@@ -471,57 +522,188 @@ function buildSvgDocument(input: XmlExportInput, tf: LandTransform, parts: Proce
   );
 
   const blocks: string[] = [];
+  const layerStack = input.layers && input.layers.length > 0 ? input.layers : null;
+  const imageBelow = hasImage && input.image!.layerOrder === "below";
 
-  if (hasImage) {
+  // Background FIRST (behind everything) — mirroring the canvas draw order
+  if (input.backgroundColor && input.backgroundColor !== "transparent") {
+    blocks.push(
+      `  <rect id="background" x="0" y="0" width="${input.width}" height="${input.height}" fill="${escapeXml(
+        input.backgroundColor
+      )}" pointer-events="none"/>`
+    );
+  }
+
+  /** CSS mix-blend-mode style for a layer (omitted for the default "normal") */
+  const blendStyleFor = (blendMode?: string) =>
+    blendMode && blendMode !== "source-over" && blendMode !== "normal"
+      ? ` style="mix-blend-mode:${escapeXml(blendMode)}"`
+      : "";
+
+  /** One <image> element baked with the shared fit/transform math */
+  const imageMarkupFor = (
+    spec: {
+      dataUrl: string;
+      naturalWidth: number;
+      naturalHeight: number;
+      fitMode: string;
+      scale: number;
+      offsetX: number;
+      offsetY: number;
+      rotation: number;
+      opacity: number;
+      blendMode?: string;
+    },
+    filterAttr: string
+  ) => {
+    const { finalW, finalH, shiftX, shiftY } = imageGeometryFor(spec, tf);
+    return `    <image x="${px(-finalW / 2)}" y="${px(-finalH / 2)}" width="${px(
+      finalW
+    )}" height="${px(
+      finalH
+    )}" xlink:href="${spec.dataUrl}" href="${spec.dataUrl}" preserveAspectRatio="none" opacity="${pct(
+      spec.opacity
+    )}" transform="translate(${px(tf.centerX + shiftX)} ${px(tf.centerY + shiftY)})${
+      spec.rotation ? ` rotate(${pct(spec.rotation)})` : ""
+    }"${filterAttr}${blendStyleFor(spec.blendMode)}/>`;
+  };
+
+  const tintRectFor = (tint: { color: string; opacity: number; blend: string }) =>
+    `    <rect x="0" y="0" width="${input.width}" height="${input.height}" fill="${escapeXml(
+      tint.color
+    )}" fill-opacity="${pct(
+      tint.opacity
+    )}" style="mix-blend-mode:${escapeXml(tint.blend || "soft-light")}" pointer-events="none"/>`;
+
+  if (layerStack) {
+    // ── Multi-layer stack (Capture Studio layer editor) — BOTTOM → TOP ──
+    const defsLines: string[] = [];
+    const anyClip = layerStack.some((l) => l.kind !== "country" && l.clipToLand);
+    if (anyClip) {
+      defsLines.push(
+        `    <clipPath id="${clipId}">`,
+        `      <path d="${pathData}" clip-rule="evenodd"/>`,
+        `    </clipPath>`
+      );
+    }
+    const usedFilterIds = new Set<string>();
+    layerStack.forEach((layer) => {
+      if (layer.kind === "country") return;
+      const f = svgFilterDef(layer.filterEffect);
+      if (f && !usedFilterIds.has(f.id)) {
+        usedFilterIds.add(f.id);
+        defsLines.push(`    ${f.markup}`);
+      }
+    });
+    if (defsLines.length > 0) {
+      blocks.push("  <defs>", ...defsLines, "  </defs>");
+    }
+
+    layerStack.forEach((layer, index) => {
+      if (layer.kind === "country") {
+        // Territory fill at its stack position (no stroke — the outline lands last)
+        if (input.fillOpacity > 0) {
+          blocks.push(
+            `  <path id="${landId}-land-fill" d="${pathData}" fill="${escapeXml(
+              input.fillColor
+            )}" fill-opacity="${pct(input.fillOpacity)}" fill-rule="evenodd"${blendStyleFor(
+              layer.blendMode
+            )} shape-rendering="geometricPrecision"/>`
+          );
+        }
+        return;
+      }
+      const f = svgFilterDef(layer.filterEffect);
+      const filterAttr = f ? ` filter="url(#${f.id})"` : "";
+      const markup = imageMarkupFor(layer, filterAttr);
+
+      if (layer.clipToLand) {
+        blocks.push(
+          [
+            `  <g id="${landId}-layer-${index}" clip-path="url(#${clipId})">`,
+            markup,
+            ...(layer.tint && layer.tint.opacity > 0 ? [tintRectFor(layer.tint)] : []),
+            `  </g>`,
+          ].join("\n")
+        );
+      } else {
+        blocks.push(markup);
+      }
+    });
+  } else if (hasImage) {
     const { finalW, finalH, shiftX, shiftY } = imageGeometry(input, tf);
     const img = input.image!;
     const filterAttr = filter ? ` filter="url(#${filter.id})"` : "";
 
-    const defs = [
-      `  <defs>`,
-      `    <clipPath id="${clipId}">`,
-      `      <path d="${pathData}" clip-rule="evenodd"/>`,
-      `    </clipPath>`,
-      ...(filter ? [`    ${filter.markup}`] : []),
-      `  </defs>`,
-    ];
+    const imageMarkup = `    <image x="${px(-finalW / 2)}" y="${px(-finalH / 2)}" width="${px(
+      finalW
+    )}" height="${px(
+      finalH
+    )}" xlink:href="${img.dataUrl}" href="${img.dataUrl}" preserveAspectRatio="none" opacity="${pct(
+      img.opacity
+    )}" transform="translate(${px(tf.centerX + shiftX)} ${px(tf.centerY + shiftY)})${
+      img.rotation ? ` rotate(${pct(img.rotation)})` : ""
+    }"${filterAttr}/>`;
 
-    const clipped = [
-      `  <g id="${landId}-flag-fill" clip-path="url(#${clipId})">`,
-      // Land base colour sits UNDERNEATH the flag, exactly like the canvas renderer
-      `    <rect x="0" y="0" width="${input.width}" height="${input.height}" fill="${escapeXml(
-        input.fillColor
-      )}" fill-opacity="${pct(input.fillOpacity)}"/>`,
-      `    <image x="${px(-finalW / 2)}" y="${px(-finalH / 2)}" width="${px(finalW)}" height="${px(
-        finalH
-      )}" xlink:href="${img.dataUrl}" href="${img.dataUrl}" preserveAspectRatio="none" opacity="${pct(
-        img.opacity
-      )}" transform="translate(${px(tf.centerX + shiftX)} ${px(tf.centerY + shiftY)})${
-        img.rotation ? ` rotate(${pct(img.rotation)})` : ""
-      }"${filterAttr}/>`,
-      ...(img.tintColor && img.tintOpacity && img.tintOpacity > 0
-        ? [
-            `    <rect x="0" y="0" width="${input.width}" height="${input.height}" fill="${escapeXml(
-              img.tintColor
-            )}" fill-opacity="${pct(
-              img.tintOpacity
-            )}" style="mix-blend-mode:${escapeXml(img.tintBlendMode || "soft-light")}"/>`,
-          ]
-        : []),
-      `  </g>`,
-    ];
+    const defsLines: string[] = [];
+    if (!imageBelow) {
+      defsLines.push(
+        `    <clipPath id="${clipId}">`,
+        `      <path d="${pathData}" clip-rule="evenodd"/>`,
+        `    </clipPath>`
+      );
+    }
+    if (filter) defsLines.push(`    ${filter.markup}`);
 
-    blocks.push(defs.join("\n"));
-    blocks.push(clipped.join("\n"));
+    if (defsLines.length > 0) {
+      blocks.push("  <defs>", ...defsLines, "  </defs>");
+    }
+
+    if (imageBelow) {
+      // Image layer BELOW the country layer: full unclipped image, the land fill
+      // (below) paints on top of it — exactly like the canvas renderer.
+      blocks.push(
+        `  <g id="${landId}-flag-fill" clip-rule="none">`,
+        imageMarkup,
+        `  </g>`
+      );
+    } else {
+      const clipped = [
+        `  <g id="${landId}-flag-fill" clip-path="url(#${clipId})">`,
+        // Land base colour sits UNDERNEATH the flag, exactly like the canvas renderer
+        `    <rect x="0" y="0" width="${input.width}" height="${input.height}" fill="${escapeXml(
+          input.fillColor
+        )}" fill-opacity="${pct(input.fillOpacity)}"/>`,
+        imageMarkup,
+        ...(img.tintColor && img.tintOpacity && img.tintOpacity > 0
+          ? [
+              `    <rect x="0" y="0" width="${input.width}" height="${input.height}" fill="${escapeXml(
+                img.tintColor
+              )}" fill-opacity="${pct(
+                img.tintOpacity
+              )}" style="mix-blend-mode:${escapeXml(img.tintBlendMode || "soft-light")}" pointer-events="none"/>`,
+            ]
+          : []),
+        `  </g>`,
+      ];
+      blocks.push(clipped.join("\n"));
+    }
   }
 
-  // Border on top of the land, mirroring the canvas draw order
+  // Land path LAST (topmost): stroke-only in stack mode so the outline stays
+  // crisp over every layer; real fill in "below" legacy mode; stroke-only when
+  // the image is masked inside it. Mirrors the canvas draw order.
+  const topmostLandFill = layerStack
+    ? "none"
+    : hasImage && !imageBelow
+      ? "none"
+      : escapeXml(input.fillColor);
   blocks.push(
     [
       `  <path id="${landId}-land"`,
       `    d="${pathData}"`,
-      `    fill="${hasImage ? "none" : escapeXml(input.fillColor)}"`,
-      hasImage ? "" : `    fill-opacity="${pct(input.fillOpacity)}"`,
+      `    fill="${topmostLandFill}"`,
+      topmostLandFill === "none" ? "" : `    fill-opacity="${pct(input.fillOpacity)}"`,
       `    fill-rule="evenodd"`,
       `    stroke="${escapeXml(input.borderColor)}"`,
       `    stroke-width="${pct(input.borderWidth)}"`,
@@ -533,14 +715,6 @@ function buildSvgDocument(input: XmlExportInput, tf: LandTransform, parts: Proce
       .filter((l) => l !== "")
       .join("\n")
   );
-
-  if (input.backgroundColor && input.backgroundColor !== "transparent") {
-    blocks.push(
-      `  <rect id="background" x="0" y="0" width="${input.width}" height="${input.height}" fill="${escapeXml(
-        input.backgroundColor
-      )}" pointer-events="none"/>`
-    );
-  }
 
   const lines = [
     `<?xml version="1.0" encoding="UTF-8"?>`,

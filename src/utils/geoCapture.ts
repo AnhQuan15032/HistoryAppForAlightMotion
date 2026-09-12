@@ -13,6 +13,15 @@ export type ImageFilterEffect =
 
 export type MapProjection = "mercator" | "equirectangular" | "naturalEarth";
 
+/**
+ * Layer order between the flag/image layer and the selected country layer.
+ *  - "masked": the image is masked (clipped) by the country's territory —
+ *              the country layer sits BELOW the image layer.
+ *  - "below":  the image is a full, unclipped layer placed BELOW the country
+ *              layer — the country fill + border are painted on top of it.
+ */
+export type ImageLayerOrder = "masked" | "below";
+
 export interface ColorCombineOptions {
   enabled: boolean;
   baseColor: string; // Background color underneath the image
@@ -33,7 +42,45 @@ export interface ImageFillOptions {
   rotation: number; // 0 to 360 degrees
   opacity: number; // 0.0 to 1.0
   colorCombine?: ColorCombineOptions;
+  /** Layer order vs the country layer — "masked" (default) or "below" */
+  layerOrder?: ImageLayerOrder;
 }
+
+/* ------------------------------------------------------------------ */
+/* Multi-layer stack (Capture Studio layer editor)                     */
+/* ------------------------------------------------------------------ */
+
+/** Shared transform parameters for painting one image layer */
+export interface ImageDrawParams {
+  image: HTMLImageElement;
+  fitMode: ImageFitMode;
+  scale: number;
+  offsetX: number;
+  offsetY: number;
+  rotation: number;
+  opacity: number;
+  filterEffect?: ImageFilterEffect;
+}
+
+export interface RenderImageLayer extends ImageDrawParams {
+  kind: "image";
+  /** Composite (blend) mode vs everything beneath this layer ("source-over" = normal) */
+  blendMode?: GlobalCompositeOperation;
+  /** Mask (clip) this layer to the selected country's territory */
+  clipToLand: boolean;
+  /** Optional atmosphere tint painted over the layer (inside the mask when clipped) */
+  tint?: { color: string; opacity: number; blend: GlobalCompositeOperation } | null;
+}
+
+export interface RenderCountryLayer {
+  kind: "country";
+  fillColor: string;
+  fillOpacity: number; // 0.0 to 1.0 (0 = invisible fill, border still draws)
+  /** Composite (blend) mode vs everything beneath this layer ("source-over" = normal) */
+  blendMode?: GlobalCompositeOperation;
+}
+
+export type RenderLayer = RenderImageLayer | RenderCountryLayer;
 
 export interface CaptureOptions {
   width: number;
@@ -49,6 +96,11 @@ export interface CaptureOptions {
   yearLabel: string;
   projection?: MapProjection;
   imageFill?: ImageFillOptions | null;
+  /**
+   * Multi-layer stack in BOTTOM → TOP order (Capture Studio layer editor).
+   * When provided, the renderer paints this stack and ignores `imageFill`.
+   */
+  layers?: RenderLayer[];
   symbols?: SymbolOptions[];
 }
 
@@ -490,16 +542,17 @@ export function renderCountryToCanvas(
     });
   };
 
-  // 1. Draw Land Fill (Solid Color OR Image on top of Base Color)
-  tracePolygons();
+  // 1. Draw Land Fill (Solid Color OR Image, honoring the layer order)
+  const activeFill =
+    imageFill && imageFill.image && imageFill.image.complete && imageFill.image.naturalWidth > 0
+      ? imageFill
+      : null;
+  const layerOrder: ImageLayerOrder = imageFill?.layerOrder ?? "masked";
 
-  if (imageFill && imageFill.image && imageFill.image.complete && imageFill.image.naturalWidth > 0) {
-    // Save state for clipping mask
-    ctx.save();
-    // 'evenodd' rule natively handles island rings and lake holes!
-    ctx.clip("evenodd");
-
-    const img = imageFill.image;
+  // Shared painter for an image layer (fit + scale + offset + rotation + filter + opacity).
+  // The caller decides whether it runs inside a country-territory clip or on the bare canvas.
+  const drawImageLayer = (p: ImageDrawParams) => {
+    const img = p.image;
     const imgW = img.naturalWidth || img.width;
     const imgH = img.naturalHeight || img.height;
     const {
@@ -509,17 +562,7 @@ export function renderCountryToCanvas(
       offsetY: pctY,
       rotation,
       opacity: imgOpacity,
-      colorCombine,
-    } = imageFill;
-
-    // STEP A: Draw Base Underlay Land Color FIRST (Underneath the Image)
-    if (colorCombine?.enabled && colorCombine.baseColor && colorCombine.baseColorOpacity > 0) {
-      ctx.fillStyle = hexToRgba(colorCombine.baseColor, colorCombine.baseColorOpacity);
-      ctx.fillRect(0, 0, width, height);
-    } else if (fillColor && fillOpacity > 0) {
-      ctx.fillStyle = hexToRgba(fillColor, fillOpacity);
-      ctx.fillRect(0, 0, width, height);
-    }
+    } = p;
 
     // Compute dimensions according to fit mode
     let baseW = actualRenderW;
@@ -550,7 +593,6 @@ export function renderCountryToCanvas(
     const shiftX = (pctX / 100) * actualRenderW;
     const shiftY = (pctY / 100) * actualRenderH;
 
-    // STEP B: Draw the Image ON TOP of the Base Color
     ctx.save();
     ctx.translate(countryCenterX + shiftX, countryCenterY + shiftY);
 
@@ -559,8 +601,8 @@ export function renderCountryToCanvas(
     }
 
     // Apply optional filter effects (grayscale, sepia, vintage film, etc.)
-    if (colorCombine?.filterEffect && colorCombine.filterEffect !== "none") {
-      switch (colorCombine.filterEffect) {
+    if (p.filterEffect && p.filterEffect !== "none") {
+      switch (p.filterEffect) {
         case "grayscale":
           ctx.filter = "grayscale(100%)";
           break;
@@ -583,18 +625,110 @@ export function renderCountryToCanvas(
     ctx.drawImage(img, -finalW / 2, -finalH / 2, finalW, finalH);
 
     ctx.restore();
+  };
+
+  const layerStack = options.layers;
+  const paintTint = (tint: { color: string; opacity: number; blend: GlobalCompositeOperation }) => {
+    ctx.save();
+    ctx.globalCompositeOperation = tint.blend || "soft-light";
+    ctx.fillStyle = hexToRgba(tint.color, tint.opacity);
+    ctx.fillRect(0, 0, width, height);
+    ctx.restore();
+  };
+
+  if (layerStack && layerStack.length > 0) {
+    // ── Multi-layer stack (Capture Studio layer editor) — BOTTOM → TOP ──
+    // Every visible image layer paints in order (optionally clipped to the
+    // territory); the country layer fills the territory at its stack position.
+    // The border below is always drawn LAST, so the outline stays crisp on top.
+    for (const layer of layerStack) {
+      if (layer.kind === "image") {
+        const img = layer.image;
+        if (!img || !img.complete || img.naturalWidth <= 0) continue;
+
+        ctx.save();
+        if (layer.clipToLand) {
+          tracePolygons();
+          ctx.clip("evenodd");
+        }
+        // Per-layer blend mode vs everything painted beneath it
+        ctx.globalCompositeOperation = layer.blendMode || "source-over";
+        drawImageLayer(layer);
+        if (layer.tint && layer.tint.opacity > 0) {
+          paintTint(layer.tint);
+        }
+        ctx.restore();
+      } else if (layer.fillOpacity > 0) {
+        ctx.save();
+        ctx.globalCompositeOperation = layer.blendMode || "source-over";
+        tracePolygons();
+        ctx.fillStyle = hexToRgba(layer.fillColor, layer.fillOpacity);
+        ctx.fill("evenodd");
+        ctx.restore();
+      }
+    }
+  } else if (activeFill && layerOrder === "below") {
+    // IMAGE LAYER BELOW THE COUNTRY LAYER:
+    // draw the full, unclipped image first, then paint the country fill on top of it.
+    drawImageLayer({
+      image: activeFill.image!,
+      fitMode: activeFill.fitMode,
+      scale: activeFill.scale,
+      offsetX: activeFill.offsetX,
+      offsetY: activeFill.offsetY,
+      rotation: activeFill.rotation,
+      opacity: activeFill.opacity,
+      filterEffect: activeFill.colorCombine?.filterEffect,
+    });
+
+    tracePolygons();
+    ctx.fillStyle = hexToRgba(fillColor, fillOpacity > 0 ? fillOpacity : 0.85);
+    ctx.fill("evenodd");
+  } else if (activeFill) {
+    // MASKED: the image is clipped inside the country territory (country layer below image)
+    tracePolygons();
+
+    // Save state for clipping mask
+    ctx.save();
+    // 'evenodd' rule natively handles island rings and lake holes!
+    ctx.clip("evenodd");
+
+    // STEP A: Draw Base Underlay Land Color FIRST (Underneath the Image)
+    if (
+      activeFill.colorCombine?.enabled &&
+      activeFill.colorCombine.baseColor &&
+      activeFill.colorCombine.baseColorOpacity > 0
+    ) {
+      ctx.fillStyle = hexToRgba(activeFill.colorCombine.baseColor, activeFill.colorCombine.baseColorOpacity);
+      ctx.fillRect(0, 0, width, height);
+    } else if (fillColor && fillOpacity > 0) {
+      ctx.fillStyle = hexToRgba(fillColor, fillOpacity);
+      ctx.fillRect(0, 0, width, height);
+    }
+
+    // STEP B: Draw the Image ON TOP of the Base Color
+    drawImageLayer({
+      image: activeFill.image!,
+      fitMode: activeFill.fitMode,
+      scale: activeFill.scale,
+      offsetX: activeFill.offsetX,
+      offsetY: activeFill.offsetY,
+      rotation: activeFill.rotation,
+      opacity: activeFill.opacity,
+      filterEffect: activeFill.colorCombine?.filterEffect,
+    });
 
     // STEP C: Optional Non-Destructive Atmosphere Tint (ONLY if explicitly enabled)
     if (
-      colorCombine?.enabled &&
-      colorCombine.tintEnabled &&
-      colorCombine.tintColor &&
-      colorCombine.tintOpacity &&
-      colorCombine.tintOpacity > 0
+      activeFill.colorCombine?.enabled &&
+      activeFill.colorCombine.tintEnabled &&
+      activeFill.colorCombine.tintColor &&
+      activeFill.colorCombine.tintOpacity &&
+      activeFill.colorCombine.tintOpacity > 0
     ) {
       ctx.save();
-      ctx.globalCompositeOperation = colorCombine.blendMode || "soft-light";
-      ctx.fillStyle = hexToRgba(colorCombine.tintColor, colorCombine.tintOpacity);
+      ctx.globalCompositeOperation = activeFill.colorCombine.blendMode || "soft-light";
+      ctx.fillStyle = hexToRgba(activeFill.colorCombine.tintColor, activeFill.colorCombine.tintOpacity);
       ctx.fillRect(0, 0, width, height);
       ctx.restore();
     }
@@ -603,6 +737,7 @@ export function renderCountryToCanvas(
     ctx.restore();
   } else {
     // Solid color fill or fallback while image is loading
+    tracePolygons();
     ctx.fillStyle = hexToRgba(fillColor, fillOpacity > 0 ? fillOpacity : 0.85);
     ctx.fill("evenodd");
   }
