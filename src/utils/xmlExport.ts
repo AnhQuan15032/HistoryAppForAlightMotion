@@ -20,7 +20,7 @@ import {
   type MapProjection,
   type ImageLayerOrder,
 } from "./geoCapture";
-import type { ImageFilterEffect } from "./geoCapture";
+import type { ImageFilterEffect, LayerShadowSpec } from "./geoCapture";
 
 export type XmlExportFormat = "svg" | "alight" | "geometry";
 
@@ -96,12 +96,16 @@ export interface XmlImageLayerSpec {
   tile?: boolean;
   /** atmosphere tint painted over this image layer */
   tint?: { color: string; opacity: number; blend: string } | null;
+  /** drop shadow cast by this layer (feDropShadow) */
+  shadow?: LayerShadowSpec | null;
 }
 
 export interface XmlCountryLayerSpec {
   kind: "country";
   /** Composite (blend) mode of the territory fill (CSS mix-blend-mode name) */
   blendMode?: string;
+  /** drop shadow cast by the territory fill (feDropShadow) */
+  shadow?: LayerShadowSpec | null;
 }
 
 export type XmlRenderLayer = XmlImageLayerSpec | XmlCountryLayerSpec;
@@ -418,40 +422,42 @@ function statsFor(input: XmlExportInput, tf: LandTransform, parts: ProcessedPart
 /* 1) SVG vector XML                                                   */
 /* ------------------------------------------------------------------ */
 
+/** Filter INNER markup (primitives) for each color-tone effect */
+const TONE_PRIMITIVES: Partial<Record<ImageFilterEffect, string>> = {
+  grayscale: '<feColorMatrix type="saturate" values="0"/>',
+  sepia:
+    '<feColorMatrix type="matrix" values="0.393 0.769 0.189 0 0 0.349 0.686 0.168 0 0 0.272 0.534 0.131 0 0 0 0 0 1 0"/><feComponentTransfer><feFuncR type="linear" slope="0.95" intercept="0.02"/><feFuncG type="linear" slope="0.95" intercept="0.02"/><feFuncB type="linear" slope="0.95" intercept="0.02"/></feComponentTransfer>',
+  vintage:
+    '<feColorMatrix type="matrix" values="0.393 0.769 0.189 0 0 0.349 0.686 0.168 0 0 0.272 0.534 0.131 0 0 0 0 0 1 0"/><feComponentTransfer><feFuncR type="linear" slope="1.1" intercept="-0.05"/><feFuncG type="linear" slope="1.1" intercept="-0.05"/><feFuncB type="linear" slope="1.1" intercept="-0.05"/></feComponentTransfer>',
+  "high-contrast":
+    '<feComponentTransfer><feFuncR type="linear" slope="1.4" intercept="-0.2"/><feFuncG type="linear" slope="1.4" intercept="-0.2"/><feFuncB type="linear" slope="1.4" intercept="-0.2"/></feComponentTransfer><feColorMatrix type="saturate" values="1.2"/>',
+  invert:
+    '<feComponentTransfer><feFuncR type="table" tableValues="1 0"/><feFuncG type="table" tableValues="1 0"/><feFuncB type="table" tableValues="1 0"/></feComponentTransfer>',
+};
+
+/** Legacy shared tone def (single-image export path) */
 function svgFilterDef(effect: ImageFilterEffect | undefined): { id: string; markup: string } | null {
-  switch (effect) {
-    case "grayscale":
-      return {
-        id: "am-tone-grayscale",
-        markup: '<filter id="am-tone-grayscale" color-interpolation-filters="sRGB"><feColorMatrix type="saturate" values="0"/></filter>',
-      };
-    case "sepia":
-      return {
-        id: "am-tone-sepia",
-        markup:
-          '<filter id="am-tone-sepia" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values="0.393 0.769 0.189 0 0 0.349 0.686 0.168 0 0 0.272 0.534 0.131 0 0 0 0 0 1 0"/><feComponentTransfer><feFuncR type="linear" slope="0.95" intercept="0.02"/><feFuncG type="linear" slope="0.95" intercept="0.02"/><feFuncB type="linear" slope="0.95" intercept="0.02"/></feComponentTransfer></filter>',
-      };
-    case "vintage":
-      return {
-        id: "am-tone-vintage",
-        markup:
-          '<filter id="am-tone-vintage" color-interpolation-filters="sRGB"><feColorMatrix type="matrix" values="0.393 0.769 0.189 0 0 0.349 0.686 0.168 0 0 0.272 0.534 0.131 0 0 0 0 0 1 0"/><feComponentTransfer><feFuncR type="linear" slope="1.1" intercept="-0.05"/><feFuncG type="linear" slope="1.1" intercept="-0.05"/><feFuncB type="linear" slope="1.1" intercept="-0.05"/></feComponentTransfer></filter>',
-      };
-    case "high-contrast":
-      return {
-        id: "am-tone-contrast",
-        markup:
-          '<filter id="am-tone-contrast" color-interpolation-filters="sRGB"><feComponentTransfer><feFuncR type="linear" slope="1.4" intercept="-0.2"/><feFuncG type="linear" slope="1.4" intercept="-0.2"/><feFuncB type="linear" slope="1.4" intercept="-0.2"/></feComponentTransfer><feColorMatrix type="saturate" values="1.2"/></filter>',
-      };
-    case "invert":
-      return {
-        id: "am-tone-invert",
-        markup:
-          '<filter id="am-tone-invert" color-interpolation-filters="sRGB"><feComponentTransfer><feFuncR type="table" tableValues="1 0"/><feFuncG type="table" tableValues="1 0"/><feFuncB type="table" tableValues="1 0"/></feComponentTransfer></filter>',
-      };
-    default:
-      return null;
-  }
+  if (!effect || effect === "none") return null;
+  const primitives = TONE_PRIMITIVES[effect];
+  if (!primitives) return null;
+  const id = `am-tone-${effect}`;
+  return { id, markup: `<filter id="${id}" color-interpolation-filters="sRGB">${primitives}</filter>` };
+}
+
+/** feDropShadow primitive matching the canvas ctx.shadow* math (blur ≈ 2×σ) */
+function shadowPrimitivesFor(shadow: LayerShadowSpec): string {
+  return `<feDropShadow dx="${px(shadow.offsetX)}" dy="${px(shadow.offsetY)}" stdDeviation="${px(
+    Math.max(0, shadow.blur) / 2
+  )}" flood-color="${escapeXml(shadow.color)}" flood-opacity="${pct(shadow.opacity)}"/>`;
+}
+
+/** One per-layer <filter> (tone primitives + optional drop shadow), region expanded so big blurs don't clip */
+function layerFxDef(id: string, primitives: string[]): string[] {
+  return [
+    `    <filter id="${id}" color-interpolation-filters="sRGB" x="-50%" y="-50%" width="200%" height="200%">`,
+    ...primitives.map((p) => `      ${p}`),
+    `    </filter>`,
+  ];
 }
 
 /** Mirrors the canvas fit-mode + transform math so the SVG flag sits exactly like the PNG one */
@@ -588,13 +594,23 @@ function buildSvgDocument(input: XmlExportInput, tf: LandTransform, parts: Proce
         `    </clipPath>`
       );
     }
-    const usedFilterIds = new Set<string>();
     layerStack.forEach((layer, index) => {
-      if (layer.kind === "country") return;
-      const f = svgFilterDef(layer.filterEffect);
-      if (f && !usedFilterIds.has(f.id)) {
-        usedFilterIds.add(f.id);
-        defsLines.push(`    ${f.markup}`);
+      if (layer.kind === "country") {
+        if (layer.shadow) {
+          defsLines.push(...layerFxDef(`${landId}-fx-country`, [shadowPrimitivesFor(layer.shadow)]));
+        }
+        return;
+      }
+      // Per-layer effect def: tone primitives + optional drop shadow
+      const primitives: string[] = [];
+      const tone =
+        layer.filterEffect && layer.filterEffect !== "none"
+          ? TONE_PRIMITIVES[layer.filterEffect]
+          : null;
+      if (tone) primitives.push(tone);
+      if (layer.shadow) primitives.push(shadowPrimitivesFor(layer.shadow));
+      if (primitives.length > 0) {
+        defsLines.push(...layerFxDef(`${landId}-fx-${index}`, primitives));
       }
       if (layer.tile) {
         // 2×2 mirrored super-tile: each cell is the image flipped across the
@@ -622,15 +638,15 @@ function buildSvgDocument(input: XmlExportInput, tf: LandTransform, parts: Proce
           blocks.push(
             `  <path id="${landId}-land-fill" d="${pathData}" fill="${escapeXml(
               input.fillColor
-            )}" fill-opacity="${pct(input.fillOpacity)}" fill-rule="evenodd"${blendStyleFor(
-              layer.blendMode
-            )} shape-rendering="geometricPrecision"/>`
+            )}" fill-opacity="${pct(input.fillOpacity)}" fill-rule="evenodd"${
+              layer.shadow ? ` filter="url(#${landId}-fx-country)"` : ""
+            }${blendStyleFor(layer.blendMode)} shape-rendering="geometricPrecision"/>`
           );
         }
         return;
       }
-      const f = svgFilterDef(layer.filterEffect);
-      const filterAttr = f ? ` filter="url(#${f.id})"` : "";
+      const hasFx = (layer.filterEffect && layer.filterEffect !== "none") || !!layer.shadow;
+      const filterAttr = hasFx ? ` filter="url(#${landId}-fx-${index})"` : "";
       const markup = layer.tile
         ? (() => {
             // Mirror-repeat texture: pattern-filled rect in the layer's local

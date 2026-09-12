@@ -50,6 +50,15 @@ export interface ImageFillOptions {
 /* Multi-layer stack (Capture Studio layer editor)                     */
 /* ------------------------------------------------------------------ */
 
+/** Per-layer drop shadow (canvas: ctx.shadow* · SVG: feDropShadow) */
+export interface LayerShadowSpec {
+  color: string; // hex
+  opacity: number; // 0.0 to 1.0
+  blur: number; // px, 0..100
+  offsetX: number; // px, -50..50
+  offsetY: number; // px, -50..50
+}
+
 /** Shared transform parameters for painting one image layer */
 export interface ImageDrawParams {
   image: HTMLImageElement;
@@ -72,6 +81,8 @@ export interface RenderImageLayer extends ImageDrawParams {
   clipToLand: boolean;
   /** Optional atmosphere tint painted over the layer (inside the mask when clipped) */
   tint?: { color: string; opacity: number; blend: GlobalCompositeOperation } | null;
+  /** Optional drop shadow cast by this layer */
+  shadow?: LayerShadowSpec | null;
 }
 
 export interface RenderCountryLayer {
@@ -80,6 +91,8 @@ export interface RenderCountryLayer {
   fillOpacity: number; // 0.0 to 1.0 (0 = invisible fill, border still draws)
   /** Composite (blend) mode vs everything beneath this layer ("source-over" = normal) */
   blendMode?: GlobalCompositeOperation;
+  /** Optional drop shadow cast by the territory fill */
+  shadow?: LayerShadowSpec | null;
 }
 
 export type RenderLayer = RenderImageLayer | RenderCountryLayer;
@@ -719,6 +732,20 @@ export function renderCountryToCanvas(
     ctx.restore();
   };
 
+  // Per-layer drop shadow state (set before a shadowed paint, cleared right after)
+  const setLayerShadow = (shadow: LayerShadowSpec) => {
+    ctx.shadowColor = hexToRgba(shadow.color, shadow.opacity);
+    ctx.shadowBlur = shadow.blur;
+    ctx.shadowOffsetX = shadow.offsetX;
+    ctx.shadowOffsetY = shadow.offsetY;
+  };
+  const clearLayerShadow = () => {
+    ctx.shadowColor = "transparent";
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+  };
+
   if (layerStack && layerStack.length > 0) {
     // ── Multi-layer stack (Capture Studio layer editor) — BOTTOM → TOP ──
     // Every visible image layer paints in order (optionally clipped to the
@@ -736,7 +763,10 @@ export function renderCountryToCanvas(
         }
         // Per-layer blend mode vs everything painted beneath it
         ctx.globalCompositeOperation = layer.blendMode || "source-over";
+        if (layer.shadow) setLayerShadow(layer.shadow);
         drawImageLayer(layer);
+        // Clear the shadow before the tint wash so the tint doesn't inherit it
+        if (layer.shadow) clearLayerShadow();
         if (layer.tint && layer.tint.opacity > 0) {
           paintTint(layer.tint);
         }
@@ -744,6 +774,7 @@ export function renderCountryToCanvas(
       } else if (layer.fillOpacity > 0) {
         ctx.save();
         ctx.globalCompositeOperation = layer.blendMode || "source-over";
+        if (layer.shadow) setLayerShadow(layer.shadow);
         tracePolygons();
         ctx.fillStyle = hexToRgba(layer.fillColor, layer.fillOpacity);
         ctx.fill("evenodd");

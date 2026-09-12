@@ -7,6 +7,7 @@ import {
   ImageFilterEffect,
   MapProjection,
   type RenderLayer,
+  type LayerShadowSpec,
 } from "../utils/geoCapture";
 import {
   ImageAsset,
@@ -36,6 +37,7 @@ import { getFeatureSovereign } from "../utils/countryFilter";
 import XmlBulkExportModal from "./XmlBulkExportModal";
 import { searchWikimediaFlags, fetchImageAsBlobUrl, WikiFlagResult } from "../utils/wikiFlags";
 import FlagAdjustPanel from "./FlagAdjustPanel";
+import ShadowControls from "./ShadowControls";
 import SymbolPicker from "./SymbolPicker";
 import { SymbolOptions, DEFAULT_SYMBOL_OPTIONS } from "../utils/symbolOverlays";
 import {
@@ -517,6 +519,11 @@ export default function CaptureModal({
     );
   }, []);
 
+  /** Drop shadow of any layer (null = off) — works for image + country rows */
+  const setLayerShadow = useCallback((id: string, shadow: LayerShadowSpec | null) => {
+    setLayers((prev) => prev.map((l) => (l.id === id ? { ...l, shadow } : l)));
+  }, []);
+
   /** Write-through setters: edit the buffer AND the selected image layer in one step */
   type LayerFieldValue<K extends "fitMode" | "scale" | "offsetX" | "offsetY" | "rotation" | "opacity"> =
     Exclude<StudioLayer[K], undefined>;
@@ -772,6 +779,7 @@ export default function CaptureModal({
             fillColor,
             fillOpacity: layer.visible ? fillOpacity : 0,
             blendMode: layer.blendMode ?? "source-over",
+            shadow: layer.shadow ?? null,
           });
           continue;
         }
@@ -795,6 +803,7 @@ export default function CaptureModal({
             tintEnabled && (layer.clipToLand ?? true)
               ? { color: tintColor, opacity: tintOpacity, blend: tintBlendMode }
               : null,
+          shadow: layer.shadow ?? null,
         });
       }
     }
@@ -1314,7 +1323,7 @@ export default function CaptureModal({
         embedLayers = [];
         for (const layer of layers) {
           if (layer.kind === "country") {
-            embedLayers.push({ kind: "country", blendMode: layer.blendMode });
+            embedLayers.push({ kind: "country", blendMode: layer.blendMode, shadow: layer.shadow ?? null });
             continue;
           }
           if (!layer.visible || !layer.src) continue;
@@ -1339,6 +1348,7 @@ export default function CaptureModal({
             filterEffect: layer.filterEffect,
             blendMode: layer.blendMode,
             tile: layer.tile === true,
+            shadow: layer.shadow ?? null,
             clipToLand: layer.clipToLand ?? true,
             tint:
               tintEnabled && (layer.clipToLand ?? true)
@@ -1921,6 +1931,14 @@ export default function CaptureModal({
                                   {blendLabel(layer.blendMode)}
                                 </span>
                               )}
+                              {layer.shadow && (
+                                <span
+                                  title="Drop shadow on"
+                                  className="shrink-0 px-1 rounded bg-slate-400/25 text-slate-200 font-bold text-[8px] leading-tight"
+                                >
+                                  🌑 Shadow
+                                </span>
+                              )}
                               <span className="truncate">
                                 {layer.kind === "country"
                                   ? "Territory · border always on top"
@@ -2062,6 +2080,11 @@ export default function CaptureModal({
                           ))}
                         </select>
                       </div>
+
+                      <ShadowControls
+                        value={selectedLayer?.shadow ?? null}
+                        onChange={(v) => selectedLayer && setLayerShadow(selectedLayer.id, v)}
+                      />
 
                       <p className="text-[9px] text-gray-500 leading-snug">
                         💡 Drag the 🏔 row ▲▼ to paint the territory OVER or UNDER your images.
@@ -2578,6 +2601,10 @@ export default function CaptureModal({
                         ))}
                       </select>
                     </div>
+                    <ShadowControls
+                      value={selectedImageLayer.shadow ?? null}
+                      onChange={(v) => setLayerShadow(selectedImageLayer.id, v)}
+                    />
                   </div>
                 )}
 

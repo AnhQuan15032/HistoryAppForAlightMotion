@@ -71,6 +71,22 @@ function makeRecordingCanvas() {
     get globalCompositeOperation() {
       return state.gco;
     },
+    shadowColor: "transparent",
+    shadowBlur: 0,
+    shadowOffsetX: 0,
+    shadowOffsetY: 0,
+    set shadowColor(v: string) {
+      calls.push(`shadowColor:${v}`);
+    },
+    set shadowBlur(v: number) {
+      calls.push(`shadowBlur:${v}`);
+    },
+    set shadowOffsetX(v: number) {
+      calls.push(`shadowOffsetX:${v}`);
+    },
+    set shadowOffsetY(v: number) {
+      calls.push(`shadowOffsetY:${v}`);
+    },
   };
   return { canvas: { width: 0, height: 0, getContext: () => ctx } as unknown as HTMLCanvasElement, calls };
 }
@@ -400,6 +416,72 @@ function assert(cond: boolean, msg: string) {
     layers: [tileLayer],
   });
   assert(tileBuilds.length === 1, "tile: mirror super-tile cached per image (built once)");
+}
+
+// 8) LAYER STACK: per-layer drop shadow — set before the paint, cleared before the next
+{
+  const { canvas, calls } = makeRecordingCanvas();
+  renderCountryToCanvas(canvas, polygons, {
+    ...baseOptions,
+    fillOpacity: 1,
+    imageFill: null,
+    layers: [
+      {
+        kind: "image",
+        image: fakeImage,
+        fitMode: "cover",
+        scale: 1,
+        offsetX: 0,
+        offsetY: 0,
+        rotation: 0,
+        opacity: 1,
+        clipToLand: true,
+        shadow: { color: "#000000", opacity: 0.6, blur: 24, offsetX: -4, offsetY: 10 },
+      },
+      {
+        kind: "country",
+        fillColor: "#DC2626",
+        fillOpacity: 0.8,
+        shadow: { color: "#7C3AED", opacity: 0.4, blur: 12, offsetX: 0, offsetY: 6 },
+      },
+    ],
+  });
+  const drawIdx = calls.indexOf("drawImage");
+  const fillIdx = calls.findIndex((c) => c === "fill:evenodd:rgba(220, 38, 38, 0.8)");
+  const imgShadowIdx = calls.indexOf("shadowColor:rgba(0, 0, 0, 0.6)");
+  const imgShadowOx = calls.indexOf("shadowOffsetX:-4");
+  const clearIdx = calls.indexOf("shadowBlur:0");
+  const countryShadowIdx = calls.indexOf("shadowColor:rgba(124, 58, 237, 0.4)");
+
+  assert(imgShadowIdx >= 0 && imgShadowIdx < drawIdx, "shadow: image layer sets shadow color before its draw");
+  assert(imgShadowOx > imgShadowIdx && imgShadowOx < drawIdx, "shadow: image layer sets its offset before its draw");
+  assert(clearIdx > drawIdx && clearIdx < fillIdx, "shadow: cleared after the image draw (before the next layer)");
+  assert(countryShadowIdx > clearIdx && countryShadowIdx < fillIdx, "shadow: country layer sets its shadow before the territory fill");
+}
+
+// 9) LAYER STACK: a shadow-less layer sets NO shadow state
+{
+  const { canvas, calls } = makeRecordingCanvas();
+  renderCountryToCanvas(canvas, polygons, {
+    ...baseOptions,
+    fillOpacity: 1,
+    imageFill: null,
+    layers: [
+      {
+        kind: "image",
+        image: fakeImage,
+        fitMode: "cover",
+        scale: 1,
+        offsetX: 0,
+        offsetY: 0,
+        rotation: 0,
+        opacity: 1,
+        clipToLand: false,
+      },
+      { kind: "country", fillColor: "#DC2626", fillOpacity: 0.8 },
+    ],
+  });
+  assert(!calls.some((c) => c.startsWith("shadow")), "shadow: no shadow state touched when no layer has one");
 }
 
 console.log("\n--- BELOW mode call sequence ---");

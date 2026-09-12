@@ -147,10 +147,18 @@ const groupClose = stacked!.xml.indexOf("</g>", firstImg);
 const tint = stacked!.xml.indexOf("mix-blend-mode:soft-light");
 assert(tint > firstImg && tint < groupClose, "stack: tint rect inside the clipped group");
 
-// Only ONE filter def for the sepia effect (shared across layers)
+// Per-layer effect defs: only the toned layer (index 0) gets one
 assert(
-  (stacked!.xml.match(/id="am-tone-sepia"/g) || []).length === 1,
-  "stack: single shared filter def"
+  (stacked!.xml.match(/id="testland-fx-\d+"/g) || []).length === 1,
+  "stack: per-layer fx def emitted only for the toned layer"
+);
+assert(
+  /id="testland-fx-0"[\s\S]{0,400}?feColorMatrix/.test(stacked!.xml),
+  "stack: fx def carries the sepia tone primitives"
+);
+assert(
+  (stacked!.xml.match(/filter="url\(#testland-fx-0\)"/g) || []).length === 1,
+  "stack: toned image references its fx def (and only it)"
 );
 
 // Per-layer blend modes → CSS mix-blend-mode on the right elements
@@ -189,6 +197,37 @@ assert(/<rect[^>]*opacity="1"[^>]*transform="translate\([0-9.-]+ [0-9.-]+\)"/.te
 const tGroup = tiledDoc!.xml.indexOf('<g id="testland-layer-0" clip-path="url(#testland-clip)">');
 const tRect = tiledDoc!.xml.indexOf('fill="url(#testland-tile-0)"');
 assert(tGroup >= 0 && tRect > tGroup, "tile: pattern rect inside the clipped layer group");
+
+// ── Per-layer SHADOW → feDropShadow filters ──
+const shadowedDoc = buildXmlDocument({
+  ...base,
+  format: "svg",
+  image: null,
+  layers: [
+    { ...imgA, shadow: { color: "#000000", opacity: 0.6, blur: 20, offsetX: -4, offsetY: 10 } },
+    { kind: "country" as const, shadow: { color: "#7C3AED", opacity: 0.4, blur: 12, offsetX: 0, offsetY: 6 } },
+  ],
+});
+
+assert(!!shadowedDoc, "shadow: document built");
+assert((shadowedDoc!.xml.match(/<feDropShadow /g) || []).length === 2, "shadow: one feDropShadow per shadowed layer");
+assert(
+  /<filter id="testland-fx-0"[\s\S]{0,600}?flood-color="#000000" flood-opacity="0\.6"/.test(shadowedDoc!.xml),
+  "shadow: image fx def carries flood color + opacity"
+);
+assert(/dx="-4" dy="10" stdDeviation="10"/.test(shadowedDoc!.xml), "shadow: offset baked, stdDeviation = blur/2");
+assert(
+  /id="testland-fx-country"[\s\S]{0,300}?flood-color="#7C3AED"/.test(shadowedDoc!.xml),
+  "shadow: country gets its own fx def"
+);
+assert(
+  /<path id="testland-land-fill"[^>]*filter="url\(#testland-fx-country\)"/.test(shadowedDoc!.xml),
+  "shadow: territory fill path references the country fx def"
+);
+assert(
+  (shadowedDoc!.xml.match(/filter="url\(#testland-fx-0\)"/g) || []).length === 1,
+  "shadow: image layer references its fx def (tone + shadow combined)"
+);
 
 console.log("\n--- BELOW MODE SVG (body excerpt) ---");
 const i = below!.xml.indexOf("<svg");

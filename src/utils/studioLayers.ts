@@ -12,7 +12,7 @@
  * Every image layer's `src` is a data URL, so the whole stack is persistable
  * (saved to IndexedDB alongside the image library — survives reload/rejoin).
  */
-import type { ImageFilterEffect, ImageFitMode } from "./geoCapture";
+import type { ImageFilterEffect, ImageFitMode, LayerShadowSpec } from "./geoCapture";
 
 /** Stable id of the single country layer in the stack */
 export const COUNTRY_LAYER_ID = "layer_country";
@@ -40,6 +40,8 @@ export interface StudioLayer {
   blendMode?: GlobalCompositeOperation;
   /** Mirror-repeat the image as a texture instead of stretching it (fit mode ignored) */
   tile?: boolean;
+  /** Drop shadow cast by this layer (null/absent = off) */
+  shadow?: LayerShadowSpec | null;
   /** Mask (clip) this layer to the selected country's territory */
   clipToLand?: boolean;
 }
@@ -133,6 +135,20 @@ export function normalizeStack(layers: StudioLayer[]): StudioLayer[] {
   return [createCountryLayer(), ...layers];
 }
 
+/** Sanitizes a stored layer shadow (missing fields → sensible defaults) */
+function sanitizeShadow(raw: unknown): LayerShadowSpec | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const s = raw as Record<string, unknown>;
+  const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+  return {
+    color: typeof s.color === "string" && s.color.startsWith("#") ? s.color : "#000000",
+    opacity: finite(s.opacity) ? Math.max(0, Math.min(1, s.opacity)) : 0.5,
+    blur: finite(s.blur) ? Math.max(0, Math.min(100, s.blur)) : 24,
+    offsetX: finite(s.offsetX) ? Math.max(-50, Math.min(50, s.offsetX)) : 0,
+    offsetY: finite(s.offsetY) ? Math.max(-50, Math.min(50, s.offsetY)) : 12,
+  };
+}
+
 /**
  * Validates + sanitizes a persisted stack coming from storage.
  * Returns null when the payload is unusable.
@@ -169,6 +185,7 @@ export function sanitizeStoredStack(raw: unknown): StudioLayer[] | null {
           ? (l.blendMode as GlobalCompositeOperation)
           : "source-over",
         tile: l.tile === true,
+        shadow: sanitizeShadow(l.shadow),
         clipToLand: l.clipToLand !== false,
       });
     } else if (l.kind === "country") {
@@ -180,6 +197,7 @@ export function sanitizeStoredStack(raw: unknown): StudioLayer[] | null {
         blendMode: BLEND_MODES.includes(l.blendMode as GlobalCompositeOperation)
           ? (l.blendMode as GlobalCompositeOperation)
           : "source-over",
+        shadow: sanitizeShadow(l.shadow),
       });
     }
   }
