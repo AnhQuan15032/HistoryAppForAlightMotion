@@ -38,6 +38,12 @@ import { searchWikimediaFlags, fetchImageAsBlobUrl, WikiFlagResult } from "../ut
 import FlagAdjustPanel from "./FlagAdjustPanel";
 import SymbolPicker from "./SymbolPicker";
 import { SymbolOptions, DEFAULT_SYMBOL_OPTIONS } from "../utils/symbolOverlays";
+import {
+  makePresetId,
+  loadStylePresets,
+  persistStylePresets,
+  type StylePreset,
+} from "../utils/stylePresets";
 
 interface CaptureModalProps {
   isOpen: boolean;
@@ -248,6 +254,11 @@ export default function CaptureModal({
   const [showFlagAdjustPanel, setShowFlagAdjustPanel] = useState<boolean>(false);
   const [symbols, setSymbols] = useState<SymbolOptions[]>([{ ...DEFAULT_SYMBOL_OPTIONS }]);
   const [showSymbolPicker, setShowSymbolPicker] = useState<boolean>(false);
+
+  // ---- Preset Creator: user-saved "looks" (persisted in localStorage) ----
+  const [stylePresets, setStylePresets] = useState<StylePreset[]>(() => loadStylePresets());
+  const [showPresetForm, setShowPresetForm] = useState<boolean>(false);
+  const [presetName, setPresetName] = useState<string>("");
 
   // ---- Vector XML export state (shared by single-capture + bulk all-era bundle) ----
   const [xmlFormat, setXmlFormat] = useState<XmlExportFormat>(() => {
@@ -1060,6 +1071,80 @@ export default function CaptureModal({
     }
   };
 
+  // ── Preset Creator: capture / restore / delete the current look ──
+  const beginSavePreset = () => {
+    setPresetName("");
+    setShowPresetForm(true);
+  };
+
+  const confirmSavePreset = () => {
+    const preset: StylePreset = {
+      id: makePresetId(),
+      name: presetName.trim() || `Preset ${stylePresets.length + 1}`,
+      createdAt: Date.now(),
+      fillType,
+      fillColor,
+      fillOpacity,
+      countryBlendMode:
+        layers.find((l) => l.kind === "country")?.blendMode ?? "source-over",
+      borderColor,
+      borderWidth,
+      backgroundColor,
+      customBgColor,
+      tintEnabled,
+      tintColor,
+      tintOpacity,
+      tintBlendMode,
+      // captured from the selected image layer, then applied to ALL image layers on restore
+      filterEffect,
+      imageBlendMode: layerBlendMode,
+      symbols: symbols.map((s) => ({ ...s })),
+      projection,
+      resolutionIndex,
+      showTitle,
+    };
+    const next = [preset, ...stylePresets];
+    setStylePresets(next);
+    persistStylePresets(next);
+    setShowPresetForm(false);
+    setPresetName("");
+  };
+
+  const handleApplyPreset = (p: StylePreset) => {
+    setFillType(p.fillType);
+    setFillColor(p.fillColor);
+    setFillOpacity(p.fillOpacity);
+    // territory blend + filter/blend on every image layer
+    setLayers((prev) =>
+      prev.map((l) =>
+        l.kind === "country"
+          ? { ...l, blendMode: p.countryBlendMode }
+          : { ...l, filterEffect: p.filterEffect, blendMode: p.imageBlendMode }
+      )
+    );
+    setBorderColor(p.borderColor);
+    setBorderWidth(p.borderWidth);
+    setBackgroundColor(p.backgroundColor);
+    setCustomBgColor(p.customBgColor);
+    setTintEnabled(p.tintEnabled);
+    setTintColor(p.tintColor);
+    setTintOpacity(p.tintOpacity);
+    setTintBlendMode(p.tintBlendMode);
+    // keep the transform buffer consistent with the layers
+    setFilterEffect(p.filterEffect);
+    setLayerBlendModeBase(p.imageBlendMode);
+    setSymbols(p.symbols.map((s) => ({ ...s })));
+    setProjection(p.projection);
+    setResolutionIndex(p.resolutionIndex);
+    setShowTitle(p.showTitle);
+  };
+
+  const handleDeletePreset = (id: string) => {
+    const next = stylePresets.filter((p) => p.id !== id);
+    setStylePresets(next);
+    persistStylePresets(next);
+  };
+
   // Interactive Canvas Pan & Zoom Handlers (operate on the selected image layer)
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     if (fillType !== "image" || !selectedImageLayer) return;
@@ -1523,6 +1608,97 @@ export default function CaptureModal({
                 <span>🎨</span>
                 <span>Solid Color Only</span>
               </button>
+            </div>
+
+            {/* Preset Creator — save / apply / delete user-defined looks */}
+            <div className="rounded-2xl bg-gray-950/90 border border-white/10 p-3 flex flex-col gap-2 shadow-lg">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                  <span>🧩</span>
+                  <span>My Presets</span>
+                  <span className="text-[9px] font-mono font-normal text-gray-500">
+                    ({stylePresets.length})
+                  </span>
+                </span>
+                {!showPresetForm && (
+                  <button
+                    onClick={beginSavePreset}
+                    title="Save the current look as a reusable preset"
+                    className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-950 text-[10px] font-black transition-colors cursor-pointer"
+                  >
+                    💾 Save Current Look
+                  </button>
+                )}
+              </div>
+
+              {showPresetForm && (
+                <div className="flex items-center gap-1.5 animate-fadeIn">
+                  <input
+                    value={presetName}
+                    onChange={(e) => setPresetName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") confirmSavePreset();
+                    }}
+                    placeholder={`Preset ${stylePresets.length + 1}`}
+                    maxLength={48}
+                    autoFocus
+                    className="flex-1 min-w-0 rounded-lg bg-gray-800 border border-white/15 py-1 px-2 text-[11px] text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                  />
+                  <button
+                    onClick={confirmSavePreset}
+                    className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-950 text-[10px] font-black transition-colors cursor-pointer"
+                  >
+                    Save
+                  </button>
+                  <button
+                    onClick={() => setShowPresetForm(false)}
+                    className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white/15 text-gray-300 text-[10px] font-bold transition-colors cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+
+              {stylePresets.length === 0 && !showPresetForm ? (
+                <p className="text-[10px] text-gray-500 leading-snug">
+                  No presets yet — dial in a look, then hit{" "}
+                  <b className="text-amber-300">💾 Save Current Look</b>.
+                </p>
+              ) : (
+                <div className="flex flex-wrap gap-1.5">
+                  {stylePresets.map((p) => (
+                    <div
+                      key={p.id}
+                      className="flex items-center gap-1.5 pl-1.5 pr-1 py-1 rounded-lg border border-white/10 bg-white/5"
+                    >
+                      <span
+                        title="Territory color"
+                        className="w-3 h-3 rounded-full border border-white/25 shrink-0"
+                        style={{ backgroundColor: p.fillColor }}
+                      />
+                      <button
+                        onClick={() => handleApplyPreset(p)}
+                        title={`Apply "${p.name}"`}
+                        className="text-[10px] font-bold text-gray-200 hover:text-amber-300 transition-colors cursor-pointer max-w-[110px] truncate"
+                      >
+                        {p.name}
+                      </button>
+                      <button
+                        onClick={() => handleDeletePreset(p.id)}
+                        title={`Delete preset "${p.name}"`}
+                        className="text-[10px] leading-none text-gray-500 hover:text-red-400 transition-colors cursor-pointer"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <p className="text-[9px] text-gray-500 leading-snug">
+                Saves fill + blend, border, background, tint, symbols, projection &amp; output
+                size. Applying a preset sets its filter + blend mode on <b>every</b> image layer.
+              </p>
             </div>
 
             {/* SECTION 1A: Solid Color Fill Settings */}
