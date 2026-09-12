@@ -6,14 +6,30 @@ import {
   ImageFitMode,
   ImageFilterEffect,
   MapProjection,
+  type RenderLayer,
 } from "../utils/geoCapture";
+import {
+  ImageAsset,
+  createAssetFromFile,
+  loadImageAssets,
+  saveImageAssets,
+  loadLayerStack,
+  saveLayerStack,
+} from "../utils/imageLibraryDb";
+import {
+  COUNTRY_LAYER_ID,
+  createCountryLayer,
+  createImageLayer,
+  normalizeStack,
+  type StudioLayer,
+} from "../utils/studioLayers";
 import { PRESET_TEXTURES, TexturePreset } from "../utils/presetTextures";
 import {
   buildXmlDocument,
   yearFromLabel,
   XML_FORMAT_INFO,
   type XmlExportFormat,
-  type XmlImageOptions,
+  type XmlRenderLayer,
 } from "../utils/xmlExport";
 import { downloadBlob, formatBytes, imageSrcToDataUrl } from "../utils/fileDownload";
 import { getFeatureSovereign } from "../utils/countryFilter";
@@ -22,6 +38,12 @@ import { searchWikimediaFlags, fetchImageAsBlobUrl, WikiFlagResult } from "../ut
 import FlagAdjustPanel from "./FlagAdjustPanel";
 import SymbolPicker from "./SymbolPicker";
 import { SymbolOptions, DEFAULT_SYMBOL_OPTIONS } from "../utils/symbolOverlays";
+import {
+  makePresetId,
+  loadStylePresets,
+  persistStylePresets,
+  type StylePreset,
+} from "../utils/stylePresets";
 
 interface CaptureModalProps {
   isOpen: boolean;
@@ -35,7 +57,7 @@ interface CaptureModalProps {
 }
 
 type FillType = "color" | "image";
-type ImageSourceType = "wiki" | "upload" | "texture";
+type ImageSourceType = "wiki" | "upload" | "texture" | "library";
 
 const PRESET_COLORS = [
   { name: "Parchment Gold", hex: "#D4AF37" },
@@ -67,6 +89,24 @@ const FILTER_EFFECTS: { label: string; id: ImageFilterEffect }[] = [
   { label: "High Contrast", id: "high-contrast" },
   { label: "Inverted", id: "invert" },
 ];
+
+const BLEND_MODE_OPTIONS: { label: string; mode: GlobalCompositeOperation }[] = [
+  { label: "Normal", mode: "source-over" },
+  { label: "Multiply", mode: "multiply" },
+  { label: "Screen", mode: "screen" },
+  { label: "Overlay", mode: "overlay" },
+  { label: "Darken", mode: "darken" },
+  { label: "Lighten", mode: "lighten" },
+  { label: "Color Dodge", mode: "color-dodge" },
+  { label: "Color Burn", mode: "color-burn" },
+  { label: "Hard Light", mode: "hard-light" },
+  { label: "Soft Light", mode: "soft-light" },
+  { label: "Difference", mode: "difference" },
+  { label: "Exclusion", mode: "exclusion" },
+];
+
+const blendLabel = (mode?: GlobalCompositeOperation) =>
+  BLEND_MODE_OPTIONS.find((b) => b.mode === mode)?.label ?? "Normal";
 
 const BACKGROUND_PRESETS = [
   { name: "Transparent", value: "transparent", icon: "🏁" },
@@ -152,20 +192,38 @@ export default function CaptureModal({
   const [fillType, setFillType] = useState<FillType>("image");
   const [imageSource, setImageSource] = useState<ImageSourceType>("wiki");
 
-  // Solid Color State
+  // Solid Color State — also the COUNTRY LAYER fill in the layer stack
   const [fillColor, setFillColor] = useState<string>(defaultFillColor);
   const [fillOpacity, setFillOpacity] = useState<number>(0.95);
 
-  // Image Fill State
-  const [uploadedImageSrc, setUploadedImageSrc] = useState<string | null>(null);
-  const [uploadedImageName, setUploadedImageName] = useState<string | null>(null);
-  const [loadedImageEl, setLoadedImageEl] = useState<HTMLImageElement | null>(null);
-  const [imageFitMode, setImageFitMode] = useState<ImageFitMode>("cover");
-  const [imageScale, setImageScale] = useState<number>(1.0);
-  const [imageOffsetX, setImageOffsetX] = useState<number>(0);
-  const [imageOffsetY, setImageOffsetY] = useState<number>(0);
-  const [imageRotation, setImageRotation] = useState<number>(0);
-  const [imageOpacity, setImageOpacity] = useState<number>(1.0);
+  // ── Layer stack (CapCut-style multi-image editor) — BOTTOM → TOP ──
+  const [layers, setLayers] = useState<StudioLayer[]>(() => [createCountryLayer()]);
+  const [selectedLayerId, setSelectedLayerId] = useState<string | null>(COUNTRY_LAYER_ID);
+  /** True once the persisted stack (or default) has been loaded on open */
+  const [stackReady, setStackReady] = useState<boolean>(false);
+  /** Decoded image element cache: src → HTMLImageElement (shared by every layer) */
+  const [layerImages, setLayerImages] = useState<Record<string, HTMLImageElement>>({});
+
+  // Live mirrors for async callbacks (avoid stale closures)
+  const layersRef = useRef<StudioLayer[]>([]);
+  const selectedLayerIdRef = useRef<string | null>(null);
+  const layerImagesRef = useRef<Record<string, HTMLImageElement>>({});
+  /** Resolves when the on-open stack restore finishes (imports wait for it) */
+  const stackReadyPromiseRef = useRef<Promise<void> | null>(null);
+  /** Set when an automatic image (default asset / wiki auto-pick) is applied */
+  const imageAutoAppliedRef = useRef<boolean>(false);
+  /** True once the wiki auto-pick has fired for the current country */
+  const wikiAutoAddedRef = useRef<boolean>(false);
+
+  // ── Transform buffer for the SELECTED image layer (write-through) ──
+  const [imageFitMode, setImageFitModeBase] = useState<ImageFitMode>("cover");
+  const [imageScale, setImageScaleBase] = useState<number>(1.0);
+  const [imageOffsetX, setImageOffsetXBase] = useState<number>(0);
+  const [imageOffsetY, setImageOffsetYBase] = useState<number>(0);
+  const [imageRotation, setImageRotationBase] = useState<number>(0);
+  const [imageOpacity, setImageOpacityBase] = useState<number>(1.0);
+  /** Blend mode of the SELECTED image layer */
+  const [layerBlendMode, setLayerBlendModeBase] = useState<GlobalCompositeOperation>("source-over");
 
   // Wikimedia Commons Flags Auto-Search State
   const [wikiFlags, setWikiFlags] = useState<WikiFlagResult[]>([]);
@@ -173,10 +231,7 @@ export default function CaptureModal({
   const [wikiSearchQuery, setWikiSearchQuery] = useState<string>("");
   const [selectedWikiFlagId, setSelectedWikiFlagId] = useState<number | null>(null);
 
-  // Combine with Base Color State (Color is UNDERNEATH image, never covering it)
-  const [combineColorEnabled, setCombineColorEnabled] = useState<boolean>(true);
-  const [baseLandColor, setBaseLandColor] = useState<string>(defaultFillColor);
-  const [baseLandOpacity, setBaseLandOpacity] = useState<number>(1.0);
+  // Atmosphere Tint State (applied per masked image layer, never replaces it)
   const [tintEnabled, setTintEnabled] = useState<boolean>(false);
   const [tintColor, setTintColor] = useState<string>("#D4AF37");
   const [tintOpacity, setTintOpacity] = useState<number>(0.3);
@@ -200,6 +255,11 @@ export default function CaptureModal({
   const [symbols, setSymbols] = useState<SymbolOptions[]>([{ ...DEFAULT_SYMBOL_OPTIONS }]);
   const [showSymbolPicker, setShowSymbolPicker] = useState<boolean>(false);
 
+  // ---- Preset Creator: user-saved "looks" (persisted in localStorage) ----
+  const [stylePresets, setStylePresets] = useState<StylePreset[]>(() => loadStylePresets());
+  const [showPresetForm, setShowPresetForm] = useState<boolean>(false);
+  const [presetName, setPresetName] = useState<string>("");
+
   // ---- Vector XML export state (shared by single-capture + bulk all-era bundle) ----
   const [xmlFormat, setXmlFormat] = useState<XmlExportFormat>(() => {
     if (typeof window === "undefined") return "svg";
@@ -218,70 +278,468 @@ export default function CaptureModal({
     }
   }, [xmlFormat]);
 
+  // ---- Image Library State (persisted in IndexedDB — survives reload / rejoin) ----
+  const [imageAssets, setImageAssets] = useState<ImageAsset[]>([]);
+  const [libraryLoaded, setLibraryLoaded] = useState<boolean>(false);
+  const [libraryError, setLibraryError] = useState<string | null>(null);
+  const [importingAssets, setImportingAssets] = useState<boolean>(false);
+  const libraryInputRef = useRef<HTMLInputElement | null>(null);
+  /** Set when the library mutates after load → triggers a persist */
+  const libraryDirtyRef = useRef<boolean>(false);
+
+  // Keep the live mirrors in sync
+  useEffect(() => {
+    layersRef.current = layers;
+  }, [layers]);
+  useEffect(() => {
+    selectedLayerIdRef.current = selectedLayerId;
+  }, [selectedLayerId]);
+  useEffect(() => {
+    layerImagesRef.current = layerImages;
+  }, [layerImages]);
+
+  // ── Open: restore the persisted image library + layer stack ──
+  // A saved stack always wins (it IS the user's last composition). Otherwise
+  // build the default: country layer + masked image layer from the marked
+  // default asset (when one exists). Imports wait on stackReadyPromiseRef so
+  // they can never race the restore.
+  useEffect(() => {
+    if (!isOpen) return;
+
+    let cancelled = false;
+    setLibraryLoaded(false);
+    setStackReady(false);
+    setSelectedWikiFlagId(null);
+    wikiAutoAddedRef.current = false;
+    imageAutoAppliedRef.current = false;
+
+    // Clean base state until the restore lands
+    setLayers([createCountryLayer()]);
+    setSelectedLayerId(COUNTRY_LAYER_ID);
+    setImageFitModeBase("cover");
+    setImageScaleBase(1.0);
+    setImageOffsetXBase(0);
+    setImageOffsetYBase(0);
+    setImageRotationBase(0);
+    setImageOpacityBase(1.0);
+    setFilterEffect("none");
+    setLayerBlendModeBase("source-over");
+
+    const ready = (async () => {
+      const [assets, stack] = await Promise.all([loadImageAssets(), loadLayerStack()]);
+      if (cancelled) return;
+
+      // Merge instead of replace: keep any asset imported while the load was in flight
+      setImageAssets((prev) => {
+        const loadedIds = new Set(assets.map((a) => a.id));
+        return [...prev.filter((a) => !loadedIds.has(a.id)), ...assets];
+      });
+      setLibraryError(null);
+      setLibraryLoaded(true);
+
+      if (stack) {
+        // Saved stack wins — restore it exactly, fill included
+        setLayers(stack.layers);
+        setSelectedLayerId(stack.selectedLayerId);
+        setFillColor(stack.fillColor);
+        setFillOpacity(stack.fillOpacity);
+
+        const sel = stack.layers.find((l) => l.id === stack.selectedLayerId);
+        if (sel && sel.kind === "image") {
+          setImageFitModeBase(sel.fitMode ?? "cover");
+          setImageScaleBase(sel.scale ?? 1);
+          setImageOffsetXBase(sel.offsetX ?? 0);
+          setImageOffsetYBase(sel.offsetY ?? 0);
+          setImageRotationBase(sel.rotation ?? 0);
+          setImageOpacityBase(sel.opacity ?? 1);
+          setFilterEffect(sel.filterEffect ?? "none");
+          setLayerBlendModeBase(sel.blendMode ?? "source-over");
+        }
+        imageAutoAppliedRef.current = false;
+      } else {
+        // One-time migration: honor the old "layer order" preference once
+        let legacyBelow = false;
+        try {
+          legacyBelow = window.localStorage.getItem("am.capture.layerOrder") === "below";
+          window.localStorage.removeItem("am.capture.layerOrder");
+        } catch {
+          /* ignore */
+        }
+
+        const defaultAsset = assets.find((a) => a.isDefault);
+        if (defaultAsset) {
+          const layer = createImageLayer(defaultAsset.dataUrl, defaultAsset.name, defaultAsset.id);
+          layer.clipToLand = !legacyBelow;
+          imageAutoAppliedRef.current = true;
+          setLayers(normalizeStack([createCountryLayer(), layer]));
+          setSelectedLayerId(layer.id);
+          setFillType("image");
+          setImageSource("library");
+        }
+      }
+
+      setStackReady(true);
+    })();
+
+    // Imports / user actions wait on this before touching the stack
+    stackReadyPromiseRef.current = ready.catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
+
+  // Persist the layer stack to IndexedDB (debounced — drags write every frame)
+  useEffect(() => {
+    if (!isOpen || !stackReady) return;
+    const t = window.setTimeout(() => {
+      void saveLayerStack({ layers, selectedLayerId, fillColor, fillOpacity }).catch(() => {
+        setLibraryError(
+          "⚠️ Couldn't save the layer stack to this device (storage full?) — layout kept for this session only"
+        );
+      });
+    }, 300);
+    return () => window.clearTimeout(t);
+  }, [layers, selectedLayerId, fillColor, fillOpacity, isOpen, stackReady]);
+
+  // Persist library changes to IndexedDB (one atomic put per change)
+  useEffect(() => {
+    if (!isOpen || !libraryLoaded || !libraryDirtyRef.current) return;
+    libraryDirtyRef.current = false;
+    void persistLibrary(imageAssets);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageAssets, libraryLoaded, isOpen]);
+
+  // Persist the whole library (one atomic IndexedDB put)
+  const persistLibrary = async (assets: ImageAsset[]) => {
+    try {
+      await saveImageAssets(assets);
+      setLibraryError(null);
+    } catch {
+      setLibraryError(
+        "⚠️ Couldn't save the library to this device (storage full?) — images kept for this session only"
+      );
+    }
+  };
+
+  // ── Layer stack operations (CapCut-style editor) ──
+
+  // Derived: the layer under the cursor and its image (selection = "current image")
+  const selectedLayer = useMemo(
+    () => layers.find((l) => l.id === selectedLayerId) ?? null,
+    [layers, selectedLayerId]
+  );
+  const selectedImageLayer = selectedLayer?.kind === "image" ? selectedLayer : null;
+  const hasImageLayer = layers.some((l) => l.kind === "image");
+  const imageLayerCount = layers.filter((l) => l.kind === "image").length;
+
+  // Derived replacements for the old single-image state
+  const uploadedImageSrc = selectedImageLayer?.src ?? null;
+  const uploadedImageName = selectedImageLayer?.name ?? null;
+
+  /** Hydrate the transform buffer from a layer (or reset to defaults) */
+  const hydrateBufferFromLayer = useCallback((layer: StudioLayer | null | undefined) => {
+    if (layer && layer.kind === "image") {
+      setImageFitModeBase(layer.fitMode ?? "cover");
+      setImageScaleBase(layer.scale ?? 1);
+      setImageOffsetXBase(layer.offsetX ?? 0);
+      setImageOffsetYBase(layer.offsetY ?? 0);
+      setImageRotationBase(layer.rotation ?? 0);
+      setImageOpacityBase(layer.opacity ?? 1);
+      setFilterEffect(layer.filterEffect ?? "none");
+      setLayerBlendModeBase(layer.blendMode ?? "source-over");
+    } else {
+      setImageFitModeBase("cover");
+      setImageScaleBase(1.0);
+      setImageOffsetXBase(0);
+      setImageOffsetYBase(0);
+      setImageRotationBase(0);
+      setImageOpacityBase(1.0);
+      setFilterEffect("none");
+      setLayerBlendModeBase("source-over");
+    }
+  }, []);
+
+  /** Select a layer (by object or id) + hydrate the transform buffer */
+  const selectLayer = useCallback(
+    (layer: StudioLayer | string | null) => {
+      const id = typeof layer === "string" || layer === null ? layer : layer.id;
+      setSelectedLayerId(id);
+      const found =
+        layer && typeof layer === "object"
+          ? layer
+          : layersRef.current.find((l) => l.id === id) ?? null;
+      hydrateBufferFromLayer(found);
+    },
+    [hydrateBufferFromLayer]
+  );
+
+  const removeLayer = useCallback((id: string) => {
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || target.kind === "country") return; // the country layer is not deletable
+    const remaining = prev.filter((l) => l.id !== id);
+    const images = remaining.filter((l) => l.kind === "image");
+    setLayers(normalizeStack(remaining));
+    if (selectedLayerIdRef.current === id) {
+      // Fall back to the front-most remaining image, or the country layer
+      selectLayer(images.length > 0 ? images[images.length - 1] : COUNTRY_LAYER_ID);
+    }
+  }, [selectLayer]);
+
+  const moveLayer = useCallback((id: string, dir: -1 | 1) => {
+    setLayers((prev) => {
+      const idx = prev.findIndex((l) => l.id === id);
+      if (idx < 0) return prev;
+      const nextIdx = idx + dir;
+      if (nextIdx < 0 || nextIdx >= prev.length) return prev;
+      const next = [...prev];
+      const [item] = next.splice(idx, 1);
+      next.splice(nextIdx, 0, item);
+      return next;
+    });
+  }, []);
+
+  const toggleLayerVisible = useCallback((id: string) => {
+    setLayers((prev) => prev.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)));
+  }, []);
+
+  const toggleLayerClip = useCallback((id: string) => {
+    setLayers((prev) =>
+      prev.map((l) => (l.id === id && l.kind === "image" ? { ...l, clipToLand: !l.clipToLand } : l))
+    );
+  }, []);
+
+  const toggleLayerTile = useCallback((id: string) => {
+    setLayers((prev) =>
+      prev.map((l) => (l.id === id && l.kind === "image" ? { ...l, tile: !l.tile } : l))
+    );
+  }, []);
+
+  /** Write-through setters: edit the buffer AND the selected image layer in one step */
+  type LayerFieldValue<K extends "fitMode" | "scale" | "offsetX" | "offsetY" | "rotation" | "opacity"> =
+    Exclude<StudioLayer[K], undefined>;
+  const makeFieldSetter = useCallback(
+    <K extends "fitMode" | "scale" | "offsetX" | "offsetY" | "rotation" | "opacity">(key: K) =>
+      (value: LayerFieldValue<K> | ((prev: LayerFieldValue<K>) => LayerFieldValue<K>)) => {
+        const sel = layersRef.current.find((l) => l.id === selectedLayerIdRef.current);
+        if (!sel || sel.kind !== "image") return;
+        const current = (
+          sel[key] ?? (key === "fitMode" ? "cover" : key === "scale" || key === "opacity" ? 1 : 0)
+        ) as LayerFieldValue<K>;
+        const next =
+          typeof value === "function"
+            ? (value as (p: LayerFieldValue<K>) => LayerFieldValue<K>)(current)
+            : value;
+        // Keep the transform buffer in sync (FlagAdjustPanel, the reset chip and
+        // the quick-reference readout all read from it)
+        switch (key) {
+          case "fitMode":
+            setImageFitModeBase(next as ImageFitMode);
+            break;
+          case "scale":
+            setImageScaleBase(next as number);
+            break;
+          case "offsetX":
+            setImageOffsetXBase(next as number);
+            break;
+          case "offsetY":
+            setImageOffsetYBase(next as number);
+            break;
+          case "rotation":
+            setImageRotationBase(next as number);
+            break;
+          case "opacity":
+            setImageOpacityBase(next as number);
+            break;
+        }
+        setLayers((prev) => prev.map((l) => (l.id === sel.id ? { ...l, [key]: next } : l)));
+      },
+    []
+  );
+  const setImageFitMode = useCallback(makeFieldSetter("fitMode"), [makeFieldSetter]);
+  const setImageScale = useCallback(makeFieldSetter("scale"), [makeFieldSetter]);
+  const setImageOffsetX = useCallback(makeFieldSetter("offsetX"), [makeFieldSetter]);
+  const setImageOffsetY = useCallback(makeFieldSetter("offsetY"), [makeFieldSetter]);
+  const setImageRotation = useCallback(makeFieldSetter("rotation"), [makeFieldSetter]);
+  const setImageOpacity = useCallback(makeFieldSetter("opacity"), [makeFieldSetter]);
+
+  /** Filter effect: buffer + selected image layer */
+  const applyFilterEffect = useCallback((effect: ImageFilterEffect) => {
+    setFilterEffect(effect);
+    setLayers((prev) =>
+      prev.map((l) =>
+        l.id === selectedLayerIdRef.current && l.kind === "image" ? { ...l, filterEffect: effect } : l
+      )
+    );
+  }, []);
+
+  /** Blend mode: buffer + selected image layer */
+  const applyLayerBlendMode = useCallback((mode: GlobalCompositeOperation) => {
+    setLayerBlendModeBase(mode);
+    setLayers((prev) =>
+      prev.map((l) =>
+        l.id === selectedLayerIdRef.current && l.kind === "image" ? { ...l, blendMode: mode } : l
+      )
+    );
+  }, []);
+
+  /** Blend mode of the COUNTRY layer (no buffer — the layer IS the source of truth) */
+  const setCountryBlendMode = useCallback((mode: GlobalCompositeOperation) => {
+    setLayers((prev) =>
+      prev.map((l) => (l.kind === "country" ? { ...l, blendMode: mode } : l))
+    );
+  }, []);
+
+  // Import one or many image files into the persisted library —
+  // each one becomes a NEW image layer on top of the stack (multi-image, CapCut-style).
+  const importFiles = async (files: FileList | File[]) => {
+    const list = Array.from(files).filter((f) => f && f.type.startsWith("image/"));
+    if (list.length === 0) return;
+
+    // Never race the on-open stack restore
+    if (stackReadyPromiseRef.current) {
+      await stackReadyPromiseRef.current;
+    }
+
+    setImportingAssets(true);
+    try {
+      const created = await Promise.all(list.map((file) => createAssetFromFile(file)));
+      const valid = created.filter((a): a is ImageAsset => a !== null);
+      if (valid.length === 0) return;
+
+      libraryDirtyRef.current = true;
+      setImageAssets((prev) => [...valid, ...prev]);
+
+      imageAutoAppliedRef.current = false;
+      const newLayers = valid.map((a) => createImageLayer(a.dataUrl, a.name, a.id));
+      setFillType("image");
+      setImageSource("library");
+      setSelectedWikiFlagId(null);
+      setLayers((prev) => normalizeStack([...prev, ...newLayers]));
+      selectLayer(newLayers[0]);
+    } finally {
+      setImportingAssets(false);
+    }
+  };
+
+  // Mark one asset as THE default (tap again to unmark). Defaults auto-load on open.
+  const handleToggleAssetDefault = (id: string) => {
+    const target = imageAssets.find((a) => a.id === id);
+    const makeDefault = !(target?.isDefault ?? false);
+    libraryDirtyRef.current = true;
+    setImageAssets((prev) =>
+      prev.map((a) => ({ ...a, isDefault: makeDefault ? a.id === id : false }))
+    );
+  };
+
+  const handleRemoveAsset = (id: string) => {
+    libraryDirtyRef.current = true;
+    setImageAssets((prev) => prev.filter((a) => a.id !== id));
+  };
+
+  // Add a library asset as a NEW image layer on top of the stack
+  const handleUseAsset = (asset: ImageAsset) => {
+    imageAutoAppliedRef.current = false;
+    const newLayer = createImageLayer(asset.dataUrl, asset.name, asset.id);
+    setFillType("image");
+    setImageSource("library");
+    setSelectedWikiFlagId(null);
+    setLayers((prev) => normalizeStack([...prev, newLayer]));
+    selectLayer(newLayer);
+  };
+
   // Canvas Pan & Drag State
   const [isPanningCanvas, setIsPanningCanvas] = useState<boolean>(false);
   const panStartRef = useRef<{ x: number; y: number; initialOffsetX: number; initialOffsetY: number } | null>(null);
   const touchDistanceRef = useRef<number | null>(null);
 
-  // Automatic Wikimedia Flag Search on Country Open
+  // Automatic Wikimedia Flag Search on Country Open (search only — the
+  // auto-ADD decision happens after the layer stack is restored)
   useEffect(() => {
     if (!isOpen || !countryName) return;
 
     setWikiLoading(true);
     setWikiSearchQuery(countryName);
     setSelectedWikiFlagId(null);
+    wikiAutoAddedRef.current = false;
 
     searchWikimediaFlags(countryName)
-      .then(async (flags) => {
+      .then((flags) => {
         setWikiFlags(flags);
         setWikiLoading(false);
-
-        // Auto-select the top matching flag if user doesn't already have an uploaded image
-        if (flags.length > 0 && !initialImageFile && !uploadedImageSrc) {
-          const topFlag = flags[0];
-          setSelectedWikiFlagId(topFlag.id);
-          const blobUrl = await fetchImageAsBlobUrl(topFlag.thumbUrl || topFlag.originalUrl);
-          setUploadedImageSrc(blobUrl);
-          setUploadedImageName(topFlag.cleanTitle);
-          setFillType("image");
-          setImageSource("wiki");
-        }
       })
       .catch(() => {
         setWikiLoading(false);
       });
   }, [isOpen, countryName]);
 
-  // Load initial file if provided
+  // Wiki auto-pick: add the top flag as the (first) image layer — but ONLY
+  // once the stack is restored AND the stack still has no image layer at all
+  // (a saved stack or a default/defaulted import always wins over auto-pick).
+  useEffect(() => {
+    if (!isOpen || !stackReady || !countryName || wikiAutoAddedRef.current) return;
+    if (initialImageFile) return;
+    if (layersRef.current.some((l) => l.kind === "image")) return;
+    const topFlag = wikiFlags[0];
+    if (!topFlag) return;
+
+    let cancelled = false;
+    (async () => {
+      const blobUrl = await fetchImageAsBlobUrl(topFlag.thumbUrl || topFlag.originalUrl);
+      if (cancelled) return;
+      // Blob URLs die on reload — convert to a data URL so the layer persists
+      const dataUrl = (await imageSrcToDataUrl(blobUrl)) || blobUrl;
+      if (cancelled) return;
+      // Double-check: a user action may have added an image layer meanwhile
+      if (layersRef.current.some((l) => l.kind === "image")) return;
+
+      const layer = createImageLayer(dataUrl, topFlag.cleanTitle);
+      wikiAutoAddedRef.current = true;
+      imageAutoAppliedRef.current = true;
+      setLayers((prev) => normalizeStack([...prev, layer]));
+      selectLayer(layer);
+      setSelectedWikiFlagId(topFlag.id);
+      setFillType("image");
+      setImageSource("wiki");
+    })().catch(() => {
+      /* network hiccup — the gallery remains available for a manual pick */
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, stackReady, countryName, wikiFlags, initialImageFile, selectLayer]);
+
+  // Load initial file if provided (imported straight into the persisted library)
   useEffect(() => {
     if (initialImageFile && isOpen) {
-      handleFileSelect(initialImageFile);
-      setImageSource("upload");
+      void importFiles([initialImageFile]);
     }
   }, [initialImageFile, isOpen]);
 
-  // Sync default color when country changes
+  // Sync default color when country changes (country layer fill follows the region)
   useEffect(() => {
     if (countryName) {
-      const c = getColorForName(countryName);
-      setFillColor(c);
-      setBaseLandColor(c);
+      setFillColor(getColorForName(countryName));
     }
   }, [countryName]);
 
-  // Load Image Element when uploadedImageSrc changes
+  // Decode every layer image src into a reusable element (cached by src)
   useEffect(() => {
-    if (!uploadedImageSrc) {
-      setLoadedImageEl(null);
-      return;
+    const seen = layerImagesRef.current;
+    for (const layer of layers) {
+      if (layer.kind !== "image" || !layer.src) continue;
+      if (seen[layer.src]) continue;
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        setLayerImages((prev) => (prev[layer.src!] ? prev : { ...prev, [layer.src!]: img }));
+      };
+      img.src = layer.src;
     }
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => {
-      setLoadedImageEl(img);
-    };
-    img.src = uploadedImageSrc;
-  }, [uploadedImageSrc]);
+  }, [layers]);
 
   // Extract geometries strictly for the active country/region
   const polygons = useMemo(() => {
@@ -301,12 +759,52 @@ export default function CaptureModal({
     if (!isOpen || !canvasRef.current || polygons.length === 0 || !activeCountry) return;
 
     const res = RESOLUTION_OPTIONS[resolutionIndex];
+
+    // Build the BOTTOM → TOP render stack from the layer editor state.
+    // In "Solid Color Only" mode the stack is ignored (plain territory fill).
+    let renderLayers: RenderLayer[] | undefined;
+    if (fillType === "image") {
+      renderLayers = [];
+      for (const layer of layers) {
+        if (layer.kind === "country") {
+          renderLayers.push({
+            kind: "country",
+            fillColor,
+            fillOpacity: layer.visible ? fillOpacity : 0,
+            blendMode: layer.blendMode ?? "source-over",
+          });
+          continue;
+        }
+        if (!layer.visible) continue;
+        const el = layer.src ? layerImages[layer.src] : null;
+        if (!el || !el.complete || el.naturalWidth <= 0) continue;
+        renderLayers.push({
+          kind: "image",
+          image: el,
+          fitMode: layer.fitMode ?? "cover",
+          scale: layer.scale ?? 1,
+          offsetX: layer.offsetX ?? 0,
+          offsetY: layer.offsetY ?? 0,
+          rotation: layer.rotation ?? 0,
+          opacity: layer.opacity ?? 1,
+          filterEffect: layer.filterEffect ?? "none",
+          blendMode: layer.blendMode ?? "source-over",
+          clipToLand: layer.clipToLand ?? true,
+          // Atmosphere tint applies to MASKED layers (inside the territory clip)
+          tint:
+            tintEnabled && (layer.clipToLand ?? true)
+              ? { color: tintColor, opacity: tintOpacity, blend: tintBlendMode }
+              : null,
+        });
+      }
+    }
+
     renderCountryToCanvas(canvasRef.current, polygons, {
       width: res.width,
       height: res.height,
       paddingRatio: 0.12,
       fillColor,
-      fillOpacity: fillType === "image" ? 0 : fillOpacity,
+      fillOpacity,
       borderColor,
       borderWidth,
       backgroundColor: backgroundColor === "custom" ? customBgColor : backgroundColor,
@@ -314,28 +812,8 @@ export default function CaptureModal({
       countryName: activeCountry,
       yearLabel,
       projection,
-      imageFill:
-        fillType === "image" && loadedImageEl
-          ? {
-              image: loadedImageEl,
-              fitMode: imageFitMode,
-              scale: imageScale,
-              offsetX: imageOffsetX,
-              offsetY: imageOffsetY,
-              rotation: imageRotation,
-              opacity: imageOpacity,
-              colorCombine: {
-                enabled: combineColorEnabled,
-                baseColor: baseLandColor,
-                baseColorOpacity: baseLandOpacity,
-                tintEnabled,
-                tintColor,
-                tintOpacity,
-                blendMode: tintBlendMode,
-                filterEffect,
-              },
-            }
-          : null,
+      imageFill: null,
+      layers: renderLayers,
       symbols: symbols.filter((s) => s.type !== "none"),
     });
   }, [
@@ -344,23 +822,14 @@ export default function CaptureModal({
     activeCountry,
     yearLabel,
     fillType,
+    layers,
+    layerImages,
     fillColor,
     fillOpacity,
-    loadedImageEl,
-    imageFitMode,
-    imageScale,
-    imageOffsetX,
-    imageOffsetY,
-    imageRotation,
-    imageOpacity,
-    combineColorEnabled,
-    baseLandColor,
-    baseLandOpacity,
     tintEnabled,
     tintColor,
     tintOpacity,
     tintBlendMode,
-    filterEffect,
     projection,
     borderColor,
     borderWidth,
@@ -371,17 +840,47 @@ export default function CaptureModal({
     symbols,
   ]);
 
-  // Handle User Selecting a Wikimedia Flag
+  // Handle User Selecting a Wikimedia Flag —
+  // replaces the selected image layer in place, or adds a new top layer
   const handleSelectWikiFlag = async (flag: WikiFlagResult) => {
+    if (stackReadyPromiseRef.current) {
+      await stackReadyPromiseRef.current;
+    }
+    imageAutoAppliedRef.current = false;
     setSelectedWikiFlagId(flag.id);
-    const blobUrl = await fetchImageAsBlobUrl(flag.thumbUrl || flag.originalUrl);
-    setUploadedImageSrc(blobUrl);
-    setUploadedImageName(flag.cleanTitle);
     setFillType("image");
-    setImageScale(1.0);
-    setImageOffsetX(0);
-    setImageOffsetY(0);
-    setImageRotation(0);
+    setImageSource("wiki");
+    const blobUrl = await fetchImageAsBlobUrl(flag.thumbUrl || flag.originalUrl);
+    // Blob URLs die on reload — convert to a data URL so the layer persists
+    const dataUrl = (await imageSrcToDataUrl(blobUrl)) || blobUrl;
+
+    const current = layersRef.current.find((l) => l.id === selectedLayerIdRef.current);
+    if (current && current.kind === "image") {
+      setLayers((prev) =>
+        prev.map((l) =>
+          l.id === current.id
+            ? {
+                ...l,
+                src: dataUrl,
+                name: flag.cleanTitle,
+                assetId: undefined,
+                scale: 1,
+                offsetX: 0,
+                offsetY: 0,
+                rotation: 0,
+              }
+            : l
+        )
+      );
+      setImageScaleBase(1.0);
+      setImageOffsetXBase(0);
+      setImageOffsetYBase(0);
+      setImageRotationBase(0);
+    } else {
+      const newLayer = createImageLayer(dataUrl, flag.cleanTitle);
+      setLayers((prev) => normalizeStack([...prev, newLayer]));
+      selectLayer(newLayer);
+    }
   };
 
   // Handle Custom Wikimedia Flag Search
@@ -422,39 +921,28 @@ export default function CaptureModal({
       });
   };
 
-  // File Upload Handlers
+  // File Upload Handlers — everything goes through the persisted library
   const handleFileSelect = (file: File) => {
     if (!file.type.startsWith("image/")) return;
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const result = e.target?.result as string;
-      setUploadedImageSrc(result);
-      setUploadedImageName(file.name);
-      setFillType("image");
-      setImageSource("upload");
-      setSelectedWikiFlagId(null);
-      setImageScale(1.0);
-      setImageOffsetX(0);
-      setImageOffsetY(0);
-      setImageRotation(0);
-    };
-    reader.readAsDataURL(file);
+    void importFiles([file]);
   };
 
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
-    if (files && files[0]) {
-      handleFileSelect(files[0]);
+    if (files && files.length > 0) {
+      void importFiles(files);
     }
+    // Allow re-selecting the same file(s) immediately after
+    e.target.value = "";
   };
 
-  // Drag & Drop Handlers on Modal
+  // Drag & Drop Handlers on Modal (drop many images at once → all imported)
   const handleModalDrop = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDraggingModalFile(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleFileSelect(e.dataTransfer.files[0]);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      void importFiles(Array.from(e.dataTransfer.files));
     }
   };
 
@@ -500,76 +988,191 @@ export default function CaptureModal({
   }, [isOpen]);
 
   const handleSelectPresetTexture = (preset: TexturePreset) => {
-    setUploadedImageSrc(preset.dataUrl);
-    setUploadedImageName(preset.name);
+    if (stackReadyPromiseRef.current) {
+      void stackReadyPromiseRef.current.then(() => applyPresetTexture(preset));
+      return;
+    }
+    applyPresetTexture(preset);
+  };
+
+  // Shared: a texture replaces the selected image layer, else becomes a new top layer
+  const applyPresetTexture = (preset: TexturePreset) => {
+    imageAutoAppliedRef.current = false;
     setFillType("image");
     setImageSource("texture");
     setSelectedWikiFlagId(null);
-    setImageScale(1.0);
-    setImageOffsetX(0);
-    setImageOffsetY(0);
-    setImageRotation(0);
+
+    const current = layersRef.current.find((l) => l.id === selectedLayerIdRef.current);
+    if (current && current.kind === "image") {
+      setLayers((prev) =>
+        prev.map((l) =>
+          l.id === current.id
+            ? {
+                ...l,
+                src: preset.dataUrl,
+                name: preset.name,
+                assetId: undefined,
+                scale: 1,
+                offsetX: 0,
+                offsetY: 0,
+                rotation: 0,
+              }
+            : l
+        )
+      );
+      setImageScaleBase(1.0);
+      setImageOffsetXBase(0);
+      setImageOffsetYBase(0);
+      setImageRotationBase(0);
+    } else {
+      const newLayer = createImageLayer(preset.dataUrl, preset.name);
+      setLayers((prev) => normalizeStack([...prev, newLayer]));
+      selectLayer(newLayer);
+    }
   };
 
   const handleRemoveImage = () => {
-    setUploadedImageSrc(null);
-    setUploadedImageName(null);
-    setLoadedImageEl(null);
+    const sel = selectedLayerIdRef.current;
+    if (!sel) return;
+    removeLayer(sel);
     setSelectedWikiFlagId(null);
-    setFillType("color");
   };
 
   const handleResetImageTransforms = useCallback(() => {
-    setImageScale(1.0);
-    setImageOffsetX(0);
-    setImageOffsetY(0);
-    setImageRotation(0);
-    setImageOpacity(1.0);
+    setImageScaleBase(1.0);
+    setImageOffsetXBase(0);
+    setImageOffsetYBase(0);
+    setImageRotationBase(0);
+    setImageOpacityBase(1.0);
+    setLayers((prev) =>
+      prev.map((l) =>
+        l.id === selectedLayerIdRef.current && l.kind === "image"
+          ? { ...l, scale: 1, offsetX: 0, offsetY: 0, rotation: 0, opacity: 1 }
+          : l
+      )
+    );
   }, []);
 
-  // Quick Aesthetic Presets for styling flags without obscuring them
+  // Quick Aesthetic Presets — sets the country layer fill + atmosphere tint,
+  // and applies the matching filter to EVERY image layer (consistent stack look)
   const handleApplyAestheticPreset = (presetType: "antique" | "royal" | "marble" | "vibrant") => {
-    setCombineColorEnabled(true);
+    let presetFilter: ImageFilterEffect | null = null;
     switch (presetType) {
       case "antique":
-        setBaseLandColor("#D4AF37");
-        setBaseLandOpacity(1.0);
+        setFillColor("#D4AF37");
         setTintEnabled(true);
         setTintColor("#D4AF37");
         setTintOpacity(0.3);
         setTintBlendMode("soft-light");
-        setFilterEffect("sepia");
+        presetFilter = "sepia";
         break;
       case "royal":
-        setBaseLandColor(defaultFillColor);
-        setBaseLandOpacity(1.0);
+        setFillColor(defaultFillColor);
         setTintEnabled(false);
-        setFilterEffect("none");
+        presetFilter = "none";
         break;
       case "marble":
-        setBaseLandColor("#E2E8F0");
-        setBaseLandOpacity(1.0);
+        setFillColor("#E2E8F0");
         setTintEnabled(true);
         setTintColor("#FFFFFF");
         setTintOpacity(0.25);
         setTintBlendMode("soft-light");
-        setFilterEffect("grayscale");
+        presetFilter = "grayscale";
         break;
       case "vibrant":
-        setBaseLandColor(defaultFillColor);
-        setBaseLandOpacity(1.0);
+        setFillColor(defaultFillColor);
         setTintEnabled(true);
         setTintColor(defaultFillColor);
         setTintOpacity(0.35);
         setTintBlendMode("overlay");
-        setFilterEffect("none");
+        presetFilter = "none";
         break;
+    }
+    if (presetFilter) {
+      setFilterEffect(presetFilter);
+      setLayers((prev) =>
+        prev.map((l) => (l.kind === "image" ? { ...l, filterEffect: presetFilter } : l))
+      );
     }
   };
 
-  // Interactive Canvas Pan & Zoom Handlers
+  // ── Preset Creator: capture / restore / delete the current look ──
+  const beginSavePreset = () => {
+    setPresetName("");
+    setShowPresetForm(true);
+  };
+
+  const confirmSavePreset = () => {
+    const preset: StylePreset = {
+      id: makePresetId(),
+      name: presetName.trim() || `Preset ${stylePresets.length + 1}`,
+      createdAt: Date.now(),
+      fillType,
+      fillColor,
+      fillOpacity,
+      countryBlendMode:
+        layers.find((l) => l.kind === "country")?.blendMode ?? "source-over",
+      borderColor,
+      borderWidth,
+      backgroundColor,
+      customBgColor,
+      tintEnabled,
+      tintColor,
+      tintOpacity,
+      tintBlendMode,
+      // captured from the selected image layer, then applied to ALL image layers on restore
+      filterEffect,
+      imageBlendMode: layerBlendMode,
+      symbols: symbols.map((s) => ({ ...s })),
+      projection,
+      resolutionIndex,
+      showTitle,
+    };
+    const next = [preset, ...stylePresets];
+    setStylePresets(next);
+    persistStylePresets(next);
+    setShowPresetForm(false);
+    setPresetName("");
+  };
+
+  const handleApplyPreset = (p: StylePreset) => {
+    setFillType(p.fillType);
+    setFillColor(p.fillColor);
+    setFillOpacity(p.fillOpacity);
+    // territory blend + filter/blend on every image layer
+    setLayers((prev) =>
+      prev.map((l) =>
+        l.kind === "country"
+          ? { ...l, blendMode: p.countryBlendMode }
+          : { ...l, filterEffect: p.filterEffect, blendMode: p.imageBlendMode }
+      )
+    );
+    setBorderColor(p.borderColor);
+    setBorderWidth(p.borderWidth);
+    setBackgroundColor(p.backgroundColor);
+    setCustomBgColor(p.customBgColor);
+    setTintEnabled(p.tintEnabled);
+    setTintColor(p.tintColor);
+    setTintOpacity(p.tintOpacity);
+    setTintBlendMode(p.tintBlendMode);
+    // keep the transform buffer consistent with the layers
+    setFilterEffect(p.filterEffect);
+    setLayerBlendModeBase(p.imageBlendMode);
+    setSymbols(p.symbols.map((s) => ({ ...s })));
+    setProjection(p.projection);
+    setResolutionIndex(p.resolutionIndex);
+    setShowTitle(p.showTitle);
+  };
+
+  const handleDeletePreset = (id: string) => {
+    const next = stylePresets.filter((p) => p.id !== id);
+    setStylePresets(next);
+    persistStylePresets(next);
+  };
+
+  // Interactive Canvas Pan & Zoom Handlers (operate on the selected image layer)
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (fillType !== "image" || !uploadedImageSrc) return;
+    if (fillType !== "image" || !selectedImageLayer) return;
     e.preventDefault();
     setIsPanningCanvas(true);
     panStartRef.current = {
@@ -604,7 +1207,7 @@ export default function CaptureModal({
   };
 
   const handleCanvasWheel = (e: React.WheelEvent<HTMLDivElement>) => {
-    if (fillType !== "image" || !uploadedImageSrc) return;
+    if (fillType !== "image" || !selectedImageLayer) return;
     e.preventDefault();
     const zoomDelta = e.deltaY < 0 ? 0.08 : -0.08;
     setImageScale((prev) => Math.round(Math.max(0.2, Math.min(4.0, prev + zoomDelta)) * 100) / 100);
@@ -612,7 +1215,7 @@ export default function CaptureModal({
 
   // Touch Support
   const handleCanvasTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
-    if (fillType !== "image" || !uploadedImageSrc) return;
+    if (fillType !== "image" || !selectedImageLayer) return;
     if (e.touches.length === 1) {
       setIsPanningCanvas(true);
       panStartRef.current = {
@@ -631,7 +1234,7 @@ export default function CaptureModal({
   };
 
   const handleCanvasTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
-    if (fillType !== "image" || !uploadedImageSrc || !canvasContainerRef.current) return;
+    if (fillType !== "image" || !selectedImageLayer || !canvasContainerRef.current) return;
     if (e.touches.length === 1 && isPanningCanvas && panStartRef.current) {
       const rect = canvasContainerRef.current.getBoundingClientRect();
       const deltaX = e.touches[0].clientX - panStartRef.current.x;
@@ -703,35 +1306,49 @@ export default function CaptureModal({
     try {
       const res = RESOLUTION_OPTIONS[resolutionIndex];
 
-      let embeddedImage: XmlImageOptions | null = null;
-      let embedFailed = false;
+      // Multi-layer stack, BOTTOM → TOP: every visible image layer + the country.
+      let embedLayers: XmlRenderLayer[] | undefined;
+      let skippedEmbeds = 0;
 
-      if (
-        xmlFormat === "svg" &&
-        xmlEmbedFlag &&
-        fillType === "image" &&
-        loadedImageEl &&
-        uploadedImageSrc
-      ) {
-        const dataUrl = await imageSrcToDataUrl(uploadedImageSrc);
-        if (dataUrl) {
-          embeddedImage = {
+      if (xmlFormat === "svg" && xmlEmbedFlag && fillType === "image" && hasImageLayer) {
+        embedLayers = [];
+        for (const layer of layers) {
+          if (layer.kind === "country") {
+            embedLayers.push({ kind: "country", blendMode: layer.blendMode });
+            continue;
+          }
+          if (!layer.visible || !layer.src) continue;
+          const dataUrl = layer.src.startsWith("data:")
+            ? layer.src
+            : await imageSrcToDataUrl(layer.src);
+          if (!dataUrl) {
+            skippedEmbeds += 1;
+            continue;
+          }
+          embedLayers.push({
+            kind: "image",
             dataUrl,
-            naturalWidth: loadedImageEl.naturalWidth || 600,
-            naturalHeight: loadedImageEl.naturalHeight || 400,
-            fitMode: imageFitMode,
-            scale: imageScale,
-            offsetX: imageOffsetX,
-            offsetY: imageOffsetY,
-            rotation: imageRotation,
-            opacity: imageOpacity,
-            filterEffect,
-            tintColor: tintEnabled ? tintColor : null,
-            tintOpacity: tintEnabled ? tintOpacity : 0,
-            tintBlendMode,
-          };
-        } else {
-          embedFailed = true;
+            naturalWidth: layerImages[layer.src]?.naturalWidth || 600,
+            naturalHeight: layerImages[layer.src]?.naturalHeight || 400,
+            fitMode: layer.fitMode ?? "cover",
+            scale: layer.scale ?? 1,
+            offsetX: layer.offsetX ?? 0,
+            offsetY: layer.offsetY ?? 0,
+            rotation: layer.rotation ?? 0,
+            opacity: layer.opacity ?? 1,
+            filterEffect: layer.filterEffect,
+            blendMode: layer.blendMode,
+            tile: layer.tile === true,
+            clipToLand: layer.clipToLand ?? true,
+            tint:
+              tintEnabled && (layer.clipToLand ?? true)
+                ? { color: tintColor, opacity: tintOpacity, blend: tintBlendMode }
+                : null,
+          });
+        }
+        // The country layer is always part of the vector stack (fill may be 0%)
+        if (!embedLayers.some((l) => l.kind === "country")) {
+          embedLayers.push({ kind: "country" });
         }
       }
 
@@ -747,13 +1364,14 @@ export default function CaptureModal({
         height: res.height,
         paddingRatio: 0.12,
         showTitle,
-        fillColor: fillType === "image" ? baseLandColor : fillColor,
-        fillOpacity: fillType === "image" ? baseLandOpacity : fillOpacity,
+        fillColor,
+        fillOpacity,
         borderColor,
         borderWidth,
         backgroundColor: backgroundColor === "custom" ? customBgColor : backgroundColor,
         includeIntroKeyframes: xmlIntroKeyframes,
-        image: embeddedImage,
+        image: null,
+        layers: embedLayers,
         symbols: symbols.filter((s) => s.type !== "none").map((s) => s.type),
       });
 
@@ -765,7 +1383,11 @@ export default function CaptureModal({
 
       downloadBlob(new Blob([built.xml], { type: built.mimeType }), built.filename);
       setXmlStatus(
-        `${embedFailed ? "⚠️ Flag could not be embedded (cross-origin) — shape exported. " : ""}Saved ${built.filename} · ${formatBytes(
+        `${
+          skippedEmbeds > 0
+            ? `⚠️ ${skippedEmbeds} image layer(s) could not be embedded (cross-origin) — `
+            : ""
+        }Saved ${built.filename} · ${formatBytes(
           built.bytes
         )} · ${built.stats.points} vertices in ${built.stats.parts} polygon part${
           built.stats.parts !== 1 ? "s" : ""
@@ -807,15 +1429,25 @@ export default function CaptureModal({
       onDragLeave={handleModalDragLeave}
       className="fixed inset-0 z-[2000] flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-md animate-fadeIn font-sans"
     >
+      {/* Global multi-image picker — shared by the Layers "＋ Add" button and the Upload tab */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        onChange={handleFileInputChange}
+        className="hidden"
+      />
+
       {/* Full Modal Drag & Drop Glowing Overlay */}
       {isDraggingModalFile && (
         <div className="absolute inset-0 z-[2500] m-4 sm:m-8 rounded-3xl border-4 border-dashed border-amber-400 bg-amber-950/80 backdrop-blur-xl flex flex-col items-center justify-center gap-3 p-6 text-center shadow-2xl animate-pulse pointer-events-none">
           <span className="text-6xl animate-bounce">📥</span>
           <h3 className="text-2xl font-black text-amber-300">
-            Drop Image to Fill {countryName}!
+            Drop Image(s) to Fill {countryName}!
           </h3>
           <p className="text-sm font-semibold text-gray-200">
-            Release to mask your image into the land boundaries of {countryName} ({yearLabel})
+            Release to add to your Library & mask into the land boundaries of {countryName} ({yearLabel})
           </p>
         </div>
       )}
@@ -882,7 +1514,7 @@ export default function CaptureModal({
               onTouchMove={handleCanvasTouchMove}
               onTouchEnd={handleCanvasTouchEnd}
               className={`relative w-full aspect-square max-w-[460px] rounded-2xl border border-white/15 flex items-center justify-center p-3 shadow-inner overflow-hidden bg-gray-950 select-none ${
-                fillType === "image" && uploadedImageSrc
+                fillType === "image" && selectedImageLayer
                   ? isPanningCanvas
                     ? "cursor-grabbing ring-2 ring-amber-400/50"
                     : "cursor-grab hover:border-amber-400/50"
@@ -909,26 +1541,24 @@ export default function CaptureModal({
               />
 
               {/* Interactive Canvas Overlay Badge when Image is Loaded */}
-              {fillType === "image" && uploadedImageSrc && (
+              {fillType === "image" && selectedImageLayer && (
                 <div className="absolute top-2.5 right-2.5 flex items-center gap-1.5 bg-gray-900/90 backdrop-blur-md border border-white/15 px-2.5 py-1 rounded-lg text-[10px] text-gray-300 shadow-md">
                   <span>🖐️</span>
                   <span>Drag to pan · Scroll to zoom</span>
                 </div>
               )}
 
-              {/* Base land color indicator */}
-              {fillType === "image" && uploadedImageSrc && combineColorEnabled && (
-                <div className="absolute top-2.5 left-2.5 flex items-center gap-1.5 bg-gray-900/90 backdrop-blur-md border border-white/15 px-2.5 py-1 rounded-lg text-[10px] text-gray-300 shadow-md">
-                  <span
-                    className="w-2.5 h-2.5 rounded-full border border-white/20"
-                    style={{ backgroundColor: baseLandColor }}
-                  />
-                  <span>Land Base Color</span>
+              {/* Selected layer chip (front of the stack = what you're editing) */}
+              {fillType === "image" && selectedImageLayer && (
+                <div className="absolute top-2.5 left-2.5 flex items-center gap-1.5 bg-gray-900/90 backdrop-blur-md border border-white/15 px-2.5 py-1 rounded-lg text-[10px] text-gray-300 shadow-md max-w-[60%]">
+                  <span>🎯</span>
+                  <span className="truncate font-semibold text-amber-300">{selectedImageLayer.name}</span>
+                  <span className="text-gray-500">editing</span>
                 </div>
               )}
 
               {/* Quick Reset Button in Preview */}
-              {fillType === "image" && uploadedImageSrc && (imageOffsetX !== 0 || imageOffsetY !== 0 || imageScale !== 1.0) && (
+              {fillType === "image" && selectedImageLayer && (imageOffsetX !== 0 || imageOffsetY !== 0 || imageScale !== 1.0) && (
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
@@ -954,8 +1584,8 @@ export default function CaptureModal({
               </span>
             </div>
 
-            {/* Flag Adjustment Panel (floating, overlays canvas area) */}
-            {fillType === "image" && uploadedImageSrc && (
+            {/* Flag Adjustment Panel (floating, overlays canvas area) — for the SELECTED image layer */}
+            {fillType === "image" && selectedImageLayer && (
               <div className="relative w-full max-w-[460px]">
                 <FlagAdjustPanel
                   scale={imageScale}
@@ -1004,6 +1634,97 @@ export default function CaptureModal({
                 <span>🎨</span>
                 <span>Solid Color Only</span>
               </button>
+            </div>
+
+            {/* Preset Creator — save / apply / delete user-defined looks */}
+            <div className="rounded-2xl bg-gray-950/90 border border-white/10 p-3 flex flex-col gap-2 shadow-lg">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                  <span>🧩</span>
+                  <span>My Presets</span>
+                  <span className="text-[9px] font-mono font-normal text-gray-500">
+                    ({stylePresets.length})
+                  </span>
+                </span>
+                {!showPresetForm && (
+                  <button
+                    onClick={beginSavePreset}
+                    title="Save the current look as a reusable preset"
+                    className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-950 text-[10px] font-black transition-colors cursor-pointer"
+                  >
+                    💾 Save Current Look
+                  </button>
+                )}
+              </div>
+
+              {showPresetForm && (
+                <div className="flex items-center gap-1.5 animate-fadeIn">
+                  <input
+                    value={presetName}
+                    onChange={(e) => setPresetName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") confirmSavePreset();
+                    }}
+                    placeholder={`Preset ${stylePresets.length + 1}`}
+                    maxLength={48}
+                    autoFocus
+                    className="flex-1 min-w-0 rounded-lg bg-gray-800 border border-white/15 py-1 px-2 text-[11px] text-gray-100 placeholder:text-gray-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                  />
+                  <button
+                    onClick={confirmSavePreset}
+                    className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-950 text-[10px] font-black transition-colors cursor-pointer"
+                  >
+                    Save
+                  </button>
+                  <button
+                    onClick={() => setShowPresetForm(false)}
+                    className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white/15 text-gray-300 text-[10px] font-bold transition-colors cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+
+              {stylePresets.length === 0 && !showPresetForm ? (
+                <p className="text-[10px] text-gray-500 leading-snug">
+                  No presets yet — dial in a look, then hit{" "}
+                  <b className="text-amber-300">💾 Save Current Look</b>.
+                </p>
+              ) : (
+                <div className="flex flex-wrap gap-1.5">
+                  {stylePresets.map((p) => (
+                    <div
+                      key={p.id}
+                      className="flex items-center gap-1.5 pl-1.5 pr-1 py-1 rounded-lg border border-white/10 bg-white/5"
+                    >
+                      <span
+                        title="Territory color"
+                        className="w-3 h-3 rounded-full border border-white/25 shrink-0"
+                        style={{ backgroundColor: p.fillColor }}
+                      />
+                      <button
+                        onClick={() => handleApplyPreset(p)}
+                        title={`Apply "${p.name}"`}
+                        className="text-[10px] font-bold text-gray-200 hover:text-amber-300 transition-colors cursor-pointer max-w-[110px] truncate"
+                      >
+                        {p.name}
+                      </button>
+                      <button
+                        onClick={() => handleDeletePreset(p.id)}
+                        title={`Delete preset "${p.name}"`}
+                        className="text-[10px] leading-none text-gray-500 hover:text-red-400 transition-colors cursor-pointer"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <p className="text-[9px] text-gray-500 leading-snug">
+                Saves fill + blend, border, background, tint, symbols, projection &amp; output
+                size. Applying a preset sets its filter + blend mode on <b>every</b> image layer.
+              </p>
             </div>
 
             {/* SECTION 1A: Solid Color Fill Settings */}
@@ -1064,11 +1785,11 @@ export default function CaptureModal({
             {/* SECTION 1B: Custom Image / Flag Fill Settings */}
             {fillType === "image" && (
               <div className="flex flex-col gap-3 animate-fadeIn">
-                {/* Sub-Tabs: Wikimedia Flags vs Custom Upload vs Presets */}
+                {/* Sub-Tabs: Wikimedia Flags vs Custom Upload vs Presets vs Library */}
                 <div className="flex rounded-lg bg-gray-950 p-1 border border-white/10 gap-1 text-[11px] font-bold">
                   <button
                     onClick={() => setImageSource("wiki")}
-                    className={`flex-1 py-1.5 px-2 rounded-md transition-all cursor-pointer flex items-center justify-center gap-1 ${
+                    className={`flex-1 py-1.5 px-1.5 rounded-md transition-all cursor-pointer flex items-center justify-center gap-1 ${
                       imageSource === "wiki"
                         ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
                         : "text-gray-400 hover:text-gray-200"
@@ -1079,18 +1800,18 @@ export default function CaptureModal({
                   </button>
                   <button
                     onClick={() => setImageSource("upload")}
-                    className={`flex-1 py-1.5 px-2 rounded-md transition-all cursor-pointer flex items-center justify-center gap-1 ${
+                    className={`flex-1 py-1.5 px-1.5 rounded-md transition-all cursor-pointer flex items-center justify-center gap-1 ${
                       imageSource === "upload"
                         ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
                         : "text-gray-400 hover:text-gray-200"
                     }`}
                   >
                     <span>📤</span>
-                    <span>Upload Image</span>
+                    <span>Upload</span>
                   </button>
                   <button
                     onClick={() => setImageSource("texture")}
-                    className={`flex-1 py-1.5 px-2 rounded-md transition-all cursor-pointer flex items-center justify-center gap-1 ${
+                    className={`flex-1 py-1.5 px-1.5 rounded-md transition-all cursor-pointer flex items-center justify-center gap-1 ${
                       imageSource === "texture"
                         ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
                         : "text-gray-400 hover:text-gray-200"
@@ -1099,6 +1820,255 @@ export default function CaptureModal({
                     <span>✨</span>
                     <span>Textures</span>
                   </button>
+                  <button
+                    onClick={() => setImageSource("library")}
+                    className={`flex-1 py-1.5 px-1.5 rounded-md transition-all cursor-pointer flex items-center justify-center gap-1 relative ${
+                      imageSource === "library"
+                        ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                        : "text-gray-400 hover:text-gray-200"
+                    }`}
+                  >
+                    <span>📚</span>
+                    <span>Library</span>
+                    {imageAssets.length > 0 && (
+                      <span className="absolute -top-1.5 -right-1 min-w-[15px] h-[15px] px-1 rounded-full bg-amber-400 text-gray-950 text-[9px] font-black flex items-center justify-center shadow">
+                        {imageAssets.length}
+                      </span>
+                    )}
+                  </button>
+                </div>
+
+                {/* ── LAYER EDITOR (CapCut-style) — frontmost layer first ── */}
+                <div className="rounded-2xl bg-gray-950/90 border border-white/10 overflow-hidden shadow-lg">
+                  <div className="flex items-center justify-between px-3 py-2 border-b border-white/10 bg-white/[0.04]">
+                    <span className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                      <span>🗂️</span>
+                      <span>Layers</span>
+                      <span className="text-[9px] font-mono font-normal text-gray-500">
+                        {imageLayerCount} image{imageLayerCount !== 1 ? "s" : ""} · 1 country
+                      </span>
+                    </span>
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={importingAssets}
+                      title="Add image(s) as new layers on top"
+                      className="px-2 py-0.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-950 text-[10px] font-black transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-wait"
+                    >
+                      ＋ Add
+                    </button>
+                  </div>
+
+                  <div className="max-h-56 overflow-y-auto custom-scrollbar">
+                    {[...layers].reverse().map((layer) => {
+                      const idx = layers.findIndex((l) => l.id === layer.id);
+                      const isSelected = layer.id === selectedLayerId;
+                      const atTop = idx === layers.length - 1;
+                      const atBottom = idx === 0;
+                      return (
+                        <div
+                          key={layer.id}
+                          onClick={() => selectLayer(layer)}
+                          className={`flex items-center gap-1.5 px-2 py-1.5 border-l-2 cursor-pointer transition-all ${
+                            isSelected
+                              ? "border-amber-400 bg-amber-400/15"
+                              : "border-transparent hover:bg-white/5"
+                          } ${layer.visible ? "" : "opacity-45"}`}
+                        >
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleLayerVisible(layer.id);
+                            }}
+                            title={layer.visible ? "Hide layer" : "Show layer"}
+                            className="w-5 shrink-0 text-[11px] leading-none cursor-pointer"
+                          >
+                            {layer.visible ? "👁" : "🚫"}
+                          </button>
+
+                          <div className="w-8 h-8 rounded-md overflow-hidden border border-white/15 bg-gray-900 shrink-0 flex items-center justify-center">
+                            {layer.kind === "image" && layer.src ? (
+                              <img
+                                src={layer.src}
+                                alt={layer.name}
+                                className="w-full h-full object-cover"
+                              />
+                            ) : (
+                              <span
+                                className="text-[10px] px-0.5"
+                                style={{ backgroundColor: fillColor }}
+                              >
+                                🏔
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex-1 min-w-0">
+                            <p
+                              className={`text-[11px] font-bold truncate leading-tight ${
+                                isSelected ? "text-amber-200" : "text-gray-200"
+                              }`}
+                            >
+                              {layer.kind === "country"
+                                ? `🏔 ${activeCountry || "Country"}`
+                                : layer.name}
+                            </p>
+                            <p className="text-[9px] text-gray-500 leading-tight truncate flex items-center gap-1">
+                              {layer.blendMode && layer.blendMode !== "source-over" && (
+                                <span
+                                  title={`Blend mode: ${blendLabel(layer.blendMode)}`}
+                                  className="shrink-0 px-1 rounded bg-purple-400/20 text-purple-300 font-bold text-[8px] leading-tight"
+                                >
+                                  {blendLabel(layer.blendMode)}
+                                </span>
+                              )}
+                              <span className="truncate">
+                                {layer.kind === "country"
+                                  ? "Territory · border always on top"
+                                  : layer.clipToLand
+                                    ? "✂️ Masked to territory"
+                                    : "Full layer (no mask)"}
+                              </span>
+                            </p>
+                          </div>
+
+                          {layer.kind === "image" && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleLayerTile(layer.id);
+                              }}
+                              title={
+                                layer.tile
+                                  ? "Tile ON — mirror-repeat texture; click to stretch instead"
+                                  : "Tile OFF — click to mirror-repeat this image as a texture"
+                              }
+                              className={`shrink-0 px-1 h-5 rounded-md text-[10px] font-bold transition-colors cursor-pointer ${
+                                layer.tile
+                                  ? "bg-amber-400/25 text-amber-300"
+                                  : "bg-white/10 text-gray-500 hover:text-gray-300"
+                              }`}
+                            >
+                              🔁
+                            </button>
+                          )}
+                          {layer.kind === "image" && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleLayerClip(layer.id);
+                              }}
+                              title={
+                                layer.clipToLand
+                                  ? "Mask ON — turn OFF for a full, unclipped image layer"
+                                  : "Mask OFF — turn ON to clip this layer to the territory"
+                              }
+                              className={`shrink-0 px-1 h-5 rounded-md text-[10px] font-bold transition-colors cursor-pointer ${
+                                layer.clipToLand
+                                  ? "bg-amber-400/25 text-amber-300"
+                                  : "bg-white/10 text-gray-500 hover:text-gray-300"
+                              }`}
+                            >
+                              ✂️
+                            </button>
+                          )}
+
+                          <div className="flex flex-col shrink-0 -my-1">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                moveLayer(layer.id, 1);
+                              }}
+                              disabled={atTop}
+                              title="Bring forward (closer to viewer)"
+                              className="text-[8px] leading-[7px] text-gray-500 hover:text-amber-300 disabled:opacity-30 cursor-pointer disabled:cursor-default px-0.5"
+                            >
+                              ▲
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                moveLayer(layer.id, -1);
+                              }}
+                              disabled={atBottom}
+                              title="Send backward (further from viewer)"
+                              className="text-[8px] leading-[7px] text-gray-500 hover:text-amber-300 disabled:opacity-30 cursor-pointer disabled:cursor-default px-0.5"
+                            >
+                              ▼
+                            </button>
+                          </div>
+
+                          {layer.kind === "image" ? (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                removeLayer(layer.id);
+                              }}
+                              title="Delete layer"
+                              className="shrink-0 w-5 h-5 rounded-md text-[10px] text-red-400 hover:bg-red-500/20 transition-colors cursor-pointer"
+                            >
+                              ✕
+                            </button>
+                          ) : (
+                            <span className="w-5 shrink-0" />
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Inline expansion — properties of the selected COUNTRY layer */}
+                  {selectedLayer?.kind === "country" && (
+                    <div className="px-3 py-2.5 border-t border-white/10 bg-amber-400/[0.04] flex flex-col gap-1.5 animate-fadeIn">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-amber-300">
+                          🏔 Country Fill
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="color"
+                            value={fillColor}
+                            onChange={(e) => setFillColor(e.target.value)}
+                            className="w-5 h-5 rounded cursor-pointer border border-white/20 bg-transparent"
+                          />
+                          <span className="font-mono text-[10px] text-gray-400 uppercase">{fillColor}</span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between text-[10px] text-gray-400">
+                        <span>Fill Opacity (0% = images show everywhere)</span>
+                        <span className="font-mono text-amber-300">{Math.round(fillOpacity * 100)}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={fillOpacity}
+                        onChange={(e) => setFillOpacity(parseFloat(e.target.value))}
+                        className="w-full accent-amber-500 cursor-pointer h-1.5 bg-gray-700 rounded-lg"
+                      />
+
+                      <div className="flex items-center justify-between text-[10px] text-gray-400">
+                        <span>Blend Mode (vs layers beneath)</span>
+                        <select
+                          value={selectedLayer?.blendMode ?? "source-over"}
+                          onChange={(e) => setCountryBlendMode(e.target.value as GlobalCompositeOperation)}
+                          className="rounded-lg bg-gray-800 border border-white/15 py-0.5 px-1.5 text-[10px] text-gray-200 focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer"
+                        >
+                          {BLEND_MODE_OPTIONS.map((b) => (
+                            <option key={b.mode} value={b.mode}>
+                              {b.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <p className="text-[9px] text-gray-500 leading-snug">
+                        💡 Drag the 🏔 row ▲▼ to paint the territory OVER or UNDER your images.
+                        The border outline always draws on top, so the outline stays crisp.
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 {/* TAB 1: Wikimedia Commons Auto Search & Gallery */}
@@ -1241,31 +2211,25 @@ export default function CaptureModal({
                   </div>
                 )}
 
-                {/* TAB 2: Upload Custom Image */}
+                {/* TAB 2: Upload Custom Images — every import becomes a NEW LAYER on top */}
                 {imageSource === "upload" && (
-                  <div>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept="image/*"
-                      onChange={handleFileInputChange}
-                      className="hidden"
-                    />
+                  <div className="flex flex-col gap-2">
+                    <div
+                      onClick={() => fileInputRef.current?.click()}
+                      className="border-2 border-dashed border-white/20 hover:border-amber-400/70 rounded-2xl p-4 text-center cursor-pointer transition-all bg-white/[0.02] hover:bg-amber-500/[0.04] text-gray-300 flex flex-col items-center justify-center gap-1.5 group"
+                    >
+                      <span className="text-3xl group-hover:scale-110 transition-transform">📤</span>
+                      <p className="text-xs font-bold text-gray-200 group-hover:text-amber-300">
+                        Click to Add Image(s) as Layers or Drag & Drop
+                      </p>
+                      <p className="text-[10px] text-gray-400">
+                        Add as many as you want — each one becomes its own layer in the stack above
+                        · saved to your Library · <kbd className="px-1 py-0.5 rounded bg-white/10 font-mono text-[9px]">Ctrl+V</kbd> pastes too
+                      </p>
+                    </div>
 
-                    {!uploadedImageSrc ? (
-                      <div
-                        onClick={() => fileInputRef.current?.click()}
-                        className="border-2 border-dashed border-white/20 hover:border-amber-400/70 rounded-2xl p-4 text-center cursor-pointer transition-all bg-white/[0.02] hover:bg-amber-500/[0.04] text-gray-300 flex flex-col items-center justify-center gap-1.5 group"
-                      >
-                        <span className="text-3xl group-hover:scale-110 transition-transform">📤</span>
-                        <p className="text-xs font-bold text-gray-200 group-hover:text-amber-300">
-                          Click to Upload Flag / Image or Drag & Drop
-                        </p>
-                        <p className="text-[10px] text-gray-400">
-                          Supports PNG, JPG, SVG, WebP · or press <kbd className="px-1 py-0.5 rounded bg-white/10 font-mono text-[9px]">Ctrl+V</kbd> to paste
-                        </p>
-                      </div>
-                    ) : (
+                    {/* The currently selected image layer (from any source) */}
+                    {uploadedImageSrc && (
                       <div className="flex items-center justify-between p-2.5 rounded-xl bg-white/[0.04] border border-white/10">
                         <div className="flex items-center gap-2.5 min-w-0">
                           <img
@@ -1277,21 +2241,25 @@ export default function CaptureModal({
                             <p className="text-xs font-bold text-gray-200 truncate">
                               {uploadedImageName || "Custom Image"}
                             </p>
-                            <p className="text-[10px] text-amber-400">Image masked on land</p>
+                            <p className="text-[10px] text-amber-400">
+                              {selectedImageLayer?.clipToLand
+                                ? "✂️ Masked to territory layer"
+                                : "Full layer (no mask)"}
+                            </p>
                           </div>
                         </div>
 
                         <div className="flex items-center gap-1.5 shrink-0">
                           <button
                             onClick={() => fileInputRef.current?.click()}
-                            title="Replace image"
+                            title="Add more image layers"
                             className="px-2 py-1 text-[11px] rounded-lg bg-white/10 hover:bg-white/20 text-gray-200 font-medium transition-colors cursor-pointer"
                           >
-                            Change
+                            ＋ More
                           </button>
                           <button
                             onClick={handleRemoveImage}
-                            title="Remove image"
+                            title="Delete this layer"
                             className="p-1 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-300 transition-colors cursor-pointer"
                           >
                             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1329,51 +2297,152 @@ export default function CaptureModal({
                   </div>
                 )}
 
-                {/* 🌟 BASE LAND COLOR (Underneath image - never covers it!) */}
-                {uploadedImageSrc && (
+                {/* TAB 4: Image Library — persisted across reloads, import many at once */}
+                {imageSource === "library" && (
+                  <div className="flex flex-col gap-2.5 bg-white/[0.02] p-3 rounded-2xl border border-white/10">
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                        <span>📚</span>
+                        <span>Image Library</span>
+                        <span className="text-[10px] font-mono font-normal text-gray-500">
+                          ({imageAssets.length})
+                        </span>
+                      </label>
+                      <button
+                        onClick={() => libraryInputRef.current?.click()}
+                        disabled={importingAssets}
+                        className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-950 font-bold text-[11px] shadow transition-all cursor-pointer disabled:opacity-50 disabled:cursor-wait shrink-0"
+                      >
+                        {importingAssets ? "Importing…" : "➕ Import Images"}
+                      </button>
+                    </div>
+
+                    <input
+                      ref={libraryInputRef}
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={handleFileInputChange}
+                      className="hidden"
+                    />
+
+                    <p className="text-[10px] text-gray-400 leading-snug">
+                      Import as many images as you want — they're saved on this device, so they're
+                      still here when you reload or join back. Tap ⭐ to mark a <b>default</b>: it
+                      auto-loads whenever the Capture Studio opens.
+                    </p>
+
+                    {libraryError && (
+                      <p className="text-[10px] text-amber-400 leading-snug">{libraryError}</p>
+                    )}
+
+                    {!libraryLoaded ? (
+                      <div className="py-5 text-center text-xs text-gray-400 flex flex-col items-center gap-1.5">
+                        <span className="w-4 h-4 rounded-full border-2 border-amber-400 border-t-transparent animate-spin" />
+                        <span>Loading your library…</span>
+                      </div>
+                    ) : imageAssets.length === 0 ? (
+                      <div className="py-5 text-center text-xs text-gray-400">
+                        <p className="text-2xl mb-1.5">🗃️</p>
+                        <p>No saved images yet.</p>
+                        <p className="text-[10px] text-gray-500 mt-1">
+                          Import images above (or drag & drop onto this window) — they'll stay here
+                          forever on this device.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-3 gap-2 max-h-64 overflow-y-auto custom-scrollbar pr-1">
+                        {imageAssets.map((asset) => {
+                          const isActive = uploadedImageSrc === asset.dataUrl;
+                          return (
+                            <div
+                              key={asset.id}
+                              className={`relative rounded-xl p-1.5 flex flex-col items-center gap-1 border transition-all ${
+                                isActive
+                                  ? "bg-amber-500/20 border-amber-400 ring-2 ring-amber-400/40 shadow-lg"
+                                  : "bg-gray-800/80 border-white/10 hover:border-amber-400/50"
+                              }`}
+                            >
+                              <button
+                                onClick={() => handleUseAsset(asset)}
+                                title={`Use "${asset.name}" as the active image`}
+                                className="w-full h-14 rounded-lg bg-gray-950/80 flex items-center justify-center overflow-hidden border border-white/10 cursor-pointer"
+                              >
+                                <img
+                                  src={asset.dataUrl}
+                                  alt={asset.name}
+                                  loading="lazy"
+                                  className="max-h-full max-w-full object-contain"
+                                />
+                              </button>
+
+                              <p
+                                className={`text-[9px] font-semibold line-clamp-1 w-full text-center leading-tight ${
+                                  isActive ? "text-amber-200" : "text-gray-300"
+                                }`}
+                              >
+                                {asset.isDefault ? "★ " : ""}
+                                {asset.name}
+                              </p>
+
+                              <div className="flex items-center gap-1">
+                                <button
+                                  onClick={() => handleToggleAssetDefault(asset.id)}
+                                  title={asset.isDefault ? "Unmark as default" : "Set as default (auto-loads on open)"}
+                                  className={`px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors cursor-pointer ${
+                                    asset.isDefault
+                                      ? "bg-amber-400/30 text-amber-300"
+                                      : "bg-white/10 text-gray-400 hover:text-amber-300"
+                                  }`}
+                                >
+                                  {asset.isDefault ? "★ Default" : "☆"}
+                                </button>
+                                <button
+                                  onClick={() => handleUseAsset(asset)}
+                                  title="Use this image"
+                                  className={`px-1.5 py-0.5 rounded-md text-[10px] font-bold transition-colors cursor-pointer ${
+                                    isActive
+                                      ? "bg-amber-400 text-gray-950"
+                                      : "bg-white/10 text-gray-300 hover:bg-amber-500/30"
+                                  }`}
+                                >
+                                  {isActive ? "✓" : "Use"}
+                                </button>
+                                <button
+                                  onClick={() => handleRemoveAsset(asset.id)}
+                                  title="Remove from library"
+                                  className="px-1.5 py-0.5 rounded-md text-[10px] bg-red-500/20 text-red-300 hover:bg-red-500/30 transition-colors cursor-pointer"
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 🌟 ATMOSPHERE & TINT (applies to every MASKED image layer) */}
+                {hasImageLayer && (
                   <div className="bg-white/[0.03] p-3 rounded-2xl border border-white/10 flex flex-col gap-2.5">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
                         <span>🎨</span>
-                        <span>Land Base Color (Underneath Flag)</span>
+                        <span>Atmosphere & Tint</span>
                       </span>
-
-                      <div className="flex items-center gap-1.5">
-                        <input
-                          type="color"
-                          value={baseLandColor}
-                          onChange={(e) => setBaseLandColor(e.target.value)}
-                          className="w-5 h-5 rounded cursor-pointer border border-white/20 bg-transparent"
-                        />
-                        <span className="font-mono text-[10px] text-amber-300 uppercase">{baseLandColor}</span>
-                      </div>
                     </div>
 
                     <p className="text-[10px] text-gray-400 leading-tight">
-                      Fills the country background underneath the image. If you scale down or move the flag, this color fills the rest of the country.
+                      A subtle wash over every <b>masked</b> image layer (inside the territory clip) —
+                      it never replaces the images. Select the 🏔 row in Layers for the territory fill.
                     </p>
 
-                    {/* Swatches for Base Land Color */}
-                    <div className="grid grid-cols-6 gap-1">
-                      {PRESET_COLORS.map((c) => (
-                        <button
-                          key={c.name}
-                          onClick={() => setBaseLandColor(c.hex)}
-                          title={c.name}
-                          className={`h-5 rounded-md border transition-all cursor-pointer ${
-                            baseLandColor.toLowerCase() === c.hex.toLowerCase()
-                              ? "border-amber-400 ring-2 ring-amber-400/40 scale-105"
-                              : "border-white/10 hover:scale-105"
-                          }`}
-                          style={{ backgroundColor: c.hex }}
-                        />
-                      ))}
-                    </div>
-
                     {/* Quick Aesthetic Styles */}
-                    <div className="pt-2 border-t border-white/10">
+                    <div>
                       <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block mb-1">
-                        ⚡ Quick Aesthetic Flag Styles
+                        ⚡ Quick Aesthetic Styles
                       </span>
                       <div className="grid grid-cols-4 gap-1">
                         <button
@@ -1407,23 +2476,7 @@ export default function CaptureModal({
                       </div>
                     </div>
 
-                    {/* Pre-filter (Grayscale, Sepia, etc.) */}
-                    <div className="flex items-center justify-between text-[11px] text-gray-300 pt-1 border-t border-white/5">
-                      <span>Image Color Tone:</span>
-                      <select
-                        value={filterEffect}
-                        onChange={(e) => setFilterEffect(e.target.value as ImageFilterEffect)}
-                        className="rounded-lg bg-gray-800 border border-white/15 py-1 px-2 text-[11px] text-gray-200 focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer"
-                      >
-                        {FILTER_EFFECTS.map((f) => (
-                          <option key={f.id} value={f.id}>
-                            {f.label}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    {/* Optional Subtle Tint (Never covers the image) */}
+                    {/* Optional Subtle Tint (Never replaces the image) */}
                     <div className="pt-1.5 border-t border-white/5 flex flex-col gap-1.5">
                       <label className="flex items-center justify-between cursor-pointer">
                         <span className="text-[11px] text-gray-300 flex items-center gap-1.5">
@@ -1483,6 +2536,51 @@ export default function CaptureModal({
                   </div>
                 )}
 
+                {/* Blend mode + color tone — apply to the SELECTED image layer */}
+                {selectedImageLayer && (
+                  <div className="flex flex-col gap-1.5 pt-1 border-t border-white/5">
+                    <label className="flex items-center justify-between text-[11px] text-gray-300 cursor-pointer">
+                      <span title="Repeat the image (mirrored) as a texture instead of stretching it">
+                        🔁 Tile (mirror repeat)
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={selectedImageLayer.tile === true}
+                        onChange={() => toggleLayerTile(selectedImageLayer.id)}
+                        className="rounded accent-amber-500 w-3.5 h-3.5 cursor-pointer"
+                      />
+                    </label>
+                    <div className="flex items-center justify-between text-[11px] text-gray-300">
+                      <span>Blend Mode (vs layers beneath):</span>
+                      <select
+                        value={layerBlendMode}
+                        onChange={(e) => applyLayerBlendMode(e.target.value as GlobalCompositeOperation)}
+                        className="rounded-lg bg-gray-800 border border-white/15 py-1 px-2 text-[11px] text-gray-200 focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer"
+                      >
+                        {BLEND_MODE_OPTIONS.map((b) => (
+                          <option key={b.mode} value={b.mode}>
+                            {b.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center justify-between text-[11px] text-gray-300">
+                      <span>Color Tone ({selectedImageLayer.name}):</span>
+                      <select
+                        value={filterEffect}
+                        onChange={(e) => applyFilterEffect(e.target.value as ImageFilterEffect)}
+                        className="rounded-lg bg-gray-800 border border-white/15 py-1 px-2 text-[11px] text-gray-200 focus:outline-none focus:ring-1 focus:ring-amber-500 cursor-pointer"
+                      >
+                        {FILTER_EFFECTS.map((f) => (
+                          <option key={f.id} value={f.id}>
+                            {f.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                )}
+
                 {/* Flag Adjustment Quick Reference (full panel is at bottom of canvas) */}
                 {uploadedImageSrc && (
                   <div className="pt-2 border-t border-white/10">
@@ -1521,7 +2619,7 @@ export default function CaptureModal({
                     isVisible={showSymbolPicker}
                     onToggle={() => setShowSymbolPicker(!showSymbolPicker)}
                     canvasRef={canvasRef}
-                    hasImage={!!uploadedImageSrc}
+                    hasImage={hasImageLayer}
                   />
                 </div>
 
@@ -1570,7 +2668,7 @@ export default function CaptureModal({
                     </p>
                   )}
 
-                  {xmlFormat === "svg" && fillType === "image" && uploadedImageSrc && (
+                  {xmlFormat === "svg" && fillType === "image" && hasImageLayer && (
                     <label className="flex items-center gap-2 text-[11px] text-gray-300 cursor-pointer">
                       <input
                         type="checkbox"
@@ -1578,7 +2676,7 @@ export default function CaptureModal({
                         onChange={(e) => setXmlEmbedFlag(e.target.checked)}
                         className="rounded accent-amber-500 w-3.5 h-3.5 cursor-pointer"
                       />
-                      <span>Embed flag image inside the SVG (clipped to the land · bigger file)</span>
+                      <span>Embed image layers inside the SVG (masked layers clipped to the land · bigger file)</span>
                     </label>
                   )}
 
@@ -1757,7 +2855,10 @@ export default function CaptureModal({
         {/* Footer Action Buttons */}
         <div className="flex items-center justify-between px-6 py-4 border-t border-white/10 bg-white/[0.02]">
           <div className="text-xs text-gray-400 hidden sm:block">
-            ✨ {fillType === "image" ? "Image on top of land base color" : "Transparent PNG land cutout"} ·{" "}
+            ✨ {fillType === "image"
+              ? `${imageLayerCount} image layer${imageLayerCount !== 1 ? "s" : ""} + country layer stack`
+              : "Transparent PNG land cutout"}{" "}
+            · 📚 {imageAssets.length} saved image{imageAssets.length !== 1 ? "s" : ""} ·{" "}
             {XML_FORMAT_INFO[xmlFormat].label} export ready ({polygons.length} polygon
             {polygons.length !== 1 ? "s" : ""})
           </div>
