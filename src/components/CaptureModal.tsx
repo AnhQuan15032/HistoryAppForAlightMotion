@@ -523,19 +523,38 @@ export default function CaptureModal({
   const makeFieldSetter = useCallback(
     <K extends "fitMode" | "scale" | "offsetX" | "offsetY" | "rotation" | "opacity">(key: K) =>
       (value: LayerFieldValue<K> | ((prev: LayerFieldValue<K>) => LayerFieldValue<K>)) => {
-        setLayers((prev) =>
-          prev.map((l) => {
-            if (l.id !== selectedLayerIdRef.current || l.kind !== "image") return l;
-            const current = (
-              l[key] ?? (key === "fitMode" ? "cover" : key === "scale" || key === "opacity" ? 1 : 0)
-            ) as LayerFieldValue<K>;
-            const next =
-              typeof value === "function"
-                ? (value as (p: LayerFieldValue<K>) => LayerFieldValue<K>)(current)
-                : value;
-            return { ...l, [key]: next };
-          })
-        );
+        const sel = layersRef.current.find((l) => l.id === selectedLayerIdRef.current);
+        if (!sel || sel.kind !== "image") return;
+        const current = (
+          sel[key] ?? (key === "fitMode" ? "cover" : key === "scale" || key === "opacity" ? 1 : 0)
+        ) as LayerFieldValue<K>;
+        const next =
+          typeof value === "function"
+            ? (value as (p: LayerFieldValue<K>) => LayerFieldValue<K>)(current)
+            : value;
+        // Keep the transform buffer in sync (FlagAdjustPanel, the reset chip and
+        // the quick-reference readout all read from it)
+        switch (key) {
+          case "fitMode":
+            setImageFitModeBase(next as ImageFitMode);
+            break;
+          case "scale":
+            setImageScaleBase(next as number);
+            break;
+          case "offsetX":
+            setImageOffsetXBase(next as number);
+            break;
+          case "offsetY":
+            setImageOffsetYBase(next as number);
+            break;
+          case "rotation":
+            setImageRotationBase(next as number);
+            break;
+          case "opacity":
+            setImageOpacityBase(next as number);
+            break;
+        }
+        setLayers((prev) => prev.map((l) => (l.id === sel.id ? { ...l, [key]: next } : l)));
       },
     []
   );
