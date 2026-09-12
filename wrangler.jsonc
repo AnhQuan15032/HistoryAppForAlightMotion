@@ -1,0 +1,13 @@
+{
+  // Cloudflare Workers deploy config for the static Vite build.
+  // CI runs `npx wrangler versions upload` with no arguments, so the assets
+  // directory must live here (not on the CLI).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "history-app-for-alight-motion",
+  "compatibility_date": "2026-09-11",
+  "assets": {
+    "directory": "./dist",
+    // Single-page app: unknown paths fall back to index.html
+    "not_found_handling": "single-page-application"
+  }
+}
